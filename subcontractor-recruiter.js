@@ -1,8 +1,11 @@
 // subcontractor-recruiter.js — Restoricon Subcontractor Recruitment, Qualification,
 // and Pipeline Management Module for Aigentik-CLI.
+//
+// B2 task 4 write-through: this module used to store subcontractors in
+// data/subcontractors.json. It now writes through to Restoricon Core's
+// /api/v1/subcontractors* routes — Core is the single source of truth,
+// Core-only, with no local-JSON fallback.
 
-import fs from 'fs';
-import path from 'path';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 import * as contacts from './contacts.js';
@@ -14,10 +17,9 @@ import {
   isRecognizedTrade
 } from './trades.js';
 
-const SUBCONTRACTORS_FILE = path.join(config.paths?.data_dir || './data', 'subcontractors.json');
-
 const CORE_API_BASE_URL = config.core_api?.base_url;
 const CORE_API_TOKEN = config.core_api?.token;
+const LIST_LIMIT = 1000;
 
 async function coreRequest(method, urlPath, { query, body } = {}) {
   if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
@@ -62,14 +64,18 @@ async function coreRequest(method, urlPath, { query, body } = {}) {
 function mapCoreToJS(coreObj) {
   if (!coreObj) return null;
   const jsObj = { ...coreObj };
-  jsObj.subcontractor_id = coreObj.external_id;
+  jsObj.subcontractor_id = coreObj.external_id || (coreObj.id ? `sub_${String(coreObj.id).padStart(4, '0')}` : null);
   jsObj.id = coreObj.id;
   jsObj.last_contact = coreObj.last_contact_at;
   
-  const boolFields = ['w9_received', 'msa_signed', 'coi_received', 'msa_sent', 'workers_comp', 'license_required', 'general_liability'];
+  const boolFields = [
+    'w9_received', 'msa_signed', 'coi_received', 'msa_sent',
+    'workers_comp', 'license_required', 'general_liability',
+    'residential_experience', 'commercial_experience', 'emergency_availability'
+  ];
   for (const field of boolFields) {
-    if (coreObj[field] === 1) jsObj[field] = true;
-    else if (coreObj[field] === 0) jsObj[field] = false;
+    if (coreObj[field] === 1 || coreObj[field] === true) jsObj[field] = true;
+    else if (coreObj[field] === 0 || coreObj[field] === false) jsObj[field] = false;
     else jsObj[field] = null;
   }
   return jsObj;
@@ -82,15 +88,18 @@ function mapJSToCore(jsObj) {
   coreObj.id = jsObj.id;
   coreObj.last_contact_at = jsObj.last_contact;
   
-  const boolFields = ['w9_received', 'msa_signed', 'coi_received', 'msa_sent', 'workers_comp', 'license_required', 'general_liability'];
+  const boolFields = [
+    'w9_received', 'msa_signed', 'coi_received', 'msa_sent',
+    'workers_comp', 'license_required', 'general_liability',
+    'residential_experience', 'commercial_experience', 'emergency_availability'
+  ];
   for (const field of boolFields) {
     if (jsObj[field] === true) coreObj[field] = 1;
     else if (jsObj[field] === false) coreObj[field] = 0;
-    else coreObj[field] = null;
+    else if (jsObj[field] === null) coreObj[field] = null;
   }
   return coreObj;
 }
-
 
 // Qualification Status Taxonomy
 const QUALIFICATION_STATUSES = {
@@ -225,36 +234,23 @@ const FOLLOW_UP_TEMPLATES = {
   document_request: "To continue the onboarding process, Restoricon will need the applicable business, licensing, insurance, tax, and agreement documentation. I'll provide the appropriate instructions for submitting those documents securely."
 };
 
-// Load subcontractors storage
-function loadSubcontractors() {
-  try {
-    if (!fs.existsSync(SUBCONTRACTORS_FILE)) {
-      const dataDir = path.dirname(SUBCONTRACTORS_FILE);
-      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-      fs.writeFileSync(SUBCONTRACTORS_FILE, JSON.stringify([], null, 2));
-      return [];
-    }
-    const raw = fs.readFileSync(SUBCONTRACTORS_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (err) {
-    log.error('subcontractor-recruiter', 'Failed to load subcontractors data', { error: err.message });
-    return [];
+// ─── Storage (Core API) ─────────────────────────────────────────────────────
+
+async function loadSubcontractors() {
+  const { ok, status, data, parseError } = await coreRequest('GET', '/api/v1/subcontractors', {
+    query: { limit: LIST_LIMIT }
+  });
+  if (!ok) {
+    throw new Error(`Core subcontractors list failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
   }
+  return (data.subcontractors || []).map(mapCoreToJS);
 }
 
-// Save subcontractors storage
 function saveSubcontractors(data) {
-  try {
-    const dataDir = path.dirname(SUBCONTRACTORS_FILE);
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(SUBCONTRACTORS_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    log.error('subcontractor-recruiter', 'Failed to save subcontractors data', { error: err.message });
-  }
+  // Deprecated: mutations write through to Core API directly.
 }
 
-// Generate unique subcontractor ID (sub_0001)
-function generateSubcontractorId(existing) {
+function generateSubcontractorId(existing = []) {
   const nums = existing
     .map(s => {
       const m = s.subcontractor_id?.match(/sub_(\d+)/);
@@ -265,27 +261,30 @@ function generateSubcontractorId(existing) {
   return `sub_${String(max + 1).padStart(4, '0')}`;
 }
 
-// Get subcontractor by ID
 async function getSubcontractorById(subcontractorId) {
   if (!subcontractorId) return null;
-  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: subcontractorId } });
+  if (typeof subcontractorId === 'number' || /^\d+$/.test(String(subcontractorId))) {
+    const { ok, data } = await coreRequest('GET', `/api/v1/subcontractors/${subcontractorId}`);
+    if (ok && data?.subcontractor) {
+      return mapCoreToJS(data.subcontractor);
+    }
+  }
+  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: String(subcontractorId) } });
   if (ok && data?.subcontractor) {
     return mapCoreToJS(data.subcontractor);
   }
   return null;
 }
 
-// Find subcontractor by phone, email, name, or business name
 async function findSubcontractor(identifier) {
   if (!identifier) return null;
-  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: identifier } });
+  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: String(identifier) } });
   if (ok && data?.subcontractor) {
     return mapCoreToJS(data.subcontractor);
   }
   return null;
 }
 
-// Create or update a subcontractor record via Core API upsert (NEW-242 / NEW-245)
 async function createOrUpdateSubcontractorLead(data) {
   const now = new Date().toISOString();
 
@@ -295,8 +294,7 @@ async function createOrUpdateSubcontractorLead(data) {
     if (existing && existing.subcontractor_id) {
       externalId = existing.subcontractor_id;
     } else {
-      const list = loadSubcontractors();
-      externalId = generateSubcontractorId(list);
+      externalId = `sub_${Date.now()}`;
     }
   }
 
@@ -321,26 +319,26 @@ async function createOrUpdateSubcontractorLead(data) {
   }
 
   const mapped = mapJSToCore(record);
-  const { ok, data: resData, status } = await coreRequest('POST', '/api/v1/subcontractors/upsert', { body: mapped });
+  const { ok, data: resData, status, parseError } = await coreRequest('POST', '/api/v1/subcontractors/upsert', { body: mapped });
 
   if (!ok) {
     log.error('subcontractor-recruiter', 'Failed to upsert subcontractor', { status });
-    return null;
+    throw new Error(`Core subcontractor upsert failed (${status}): ${resData?.error || parseError?.message || 'unknown error'}`);
   }
 
-  const finalRecord = resData?.subcontractor || mapCoreToJS(resData) || record;
+  const finalRecord = resData?.subcontractor ? mapCoreToJS(resData.subcontractor) : mapCoreToJS(resData) || record;
   syncWithContacts(finalRecord);
   log.info('subcontractor-recruiter', `Upserted subcontractor lead: ${finalRecord.company_name || finalRecord.contact_name || finalRecord.subcontractor_id}`);
   return finalRecord;
 }
 
-// Update an existing subcontractor by ID
 async function updateSubcontractor(subcontractorId, updates) {
   if (!subcontractorId) return null;
   
   let numericId = updates.id;
+  let existing = null;
   if (!numericId) {
-    const existing = await getSubcontractorById(subcontractorId);
+    existing = await getSubcontractorById(subcontractorId);
     if (!existing) return null;
     numericId = existing.id;
     updates = { ...existing, ...updates, qualification_data: { ...(existing.qualification_data || {}), ...(updates.qualification_data || {}) } };
@@ -356,23 +354,24 @@ async function updateSubcontractor(subcontractorId, updates) {
   }
 
   const mapped = mapJSToCore(updates);
-  const { ok, status } = await coreRequest('POST', `/api/v1/subcontractors/${numericId}/update`, { body: mapped });
+  const { ok, status, data: resData, parseError } = await coreRequest('POST', `/api/v1/subcontractors/${numericId}/update`, { body: mapped });
   
   if (!ok) {
     log.error('subcontractor-recruiter', 'Failed to update subcontractor', { status });
-    return null;
+    throw new Error(`Core subcontractor update failed (${status}): ${resData?.error || parseError?.message || 'unknown error'}`);
   }
 
   if (updates.qualification_status) {
-     await coreRequest('POST', `/api/v1/subcontractors/${numericId}/qualification`, { 
-       body: { qualification_status: updates.qualification_status } 
-     });
+    await coreRequest('POST', `/api/v1/subcontractors/${numericId}/qualification`, { 
+      body: { qualification_status: updates.qualification_status, recruitment_step: updates.recruitment_step } 
+    });
   }
 
-  syncWithContacts(updates);
-  return updates;
+  const updatedRecord = resData?.subcontractor ? mapCoreToJS(resData.subcontractor) : updates;
+  syncWithContacts(updatedRecord);
+  return updatedRecord;
 }
-// Synchronize subcontractor record with contacts.json
+
 function syncWithContacts(subcontractor) {
   try {
     const contactList = contacts.loadContacts();
@@ -428,7 +427,6 @@ function syncWithContacts(subcontractor) {
   }
 }
 
-// Compute missing onboarding documentation
 function getMissingDocuments(subcontractor) {
   if (!subcontractor) return [];
   const missing = [];
@@ -455,9 +453,7 @@ function getMissingDocuments(subcontractor) {
   return missing;
 }
 
-// Determine qualification status dynamically based on collected data and review standing
 function determineQualificationStatus(subcontractor) {
-  // Never automatically promote to APPROVED_ONBOARDING or ONBOARDING_COMPLETE without human owner action
   if (subcontractor.qualification_status === QUALIFICATION_STATUSES.APPROVED_ONBOARDING) {
     return QUALIFICATION_STATUSES.APPROVED_ONBOARDING;
   }
@@ -474,7 +470,6 @@ function determineQualificationStatus(subcontractor) {
     return QUALIFICATION_STATUSES.FOLLOW_UP_REQUESTED;
   }
 
-  // Check document review standing
   if (subcontractor.w9_received && subcontractor.msa_signed && subcontractor.coi_received) {
     return QUALIFICATION_STATUSES.DOCUMENTS_UNDER_REVIEW;
   }
@@ -488,7 +483,6 @@ function determineQualificationStatus(subcontractor) {
     return QUALIFICATION_STATUSES.DOCUMENTS_REQUESTED;
   }
 
-  // Check if basic qualification has been completed
   const hasBasicCompanyInfo = Boolean(subcontractor.company_name || subcontractor.legal_name || subcontractor.contact_name);
   const hasTrade = Boolean(subcontractor.primary_trade);
   const hasServiceArea = Boolean(subcontractor.service_area);
@@ -515,7 +509,6 @@ function determineQualificationStatus(subcontractor) {
   return QUALIFICATION_STATUSES.NEW_LEAD;
 }
 
-// Determine next logical conversational recruitment step
 function determineNextRecruitmentStep(subcontractor) {
   if (!subcontractor) return RECRUITMENT_STEPS.OPENING;
   const q = subcontractor.qualification_data || {};
@@ -557,7 +550,6 @@ function determineNextRecruitmentStep(subcontractor) {
   return RECRUITMENT_STEPS.DOCUMENTS_REQUEST;
 }
 
-// Build Recruiter System Prompt for LLM with comprehensive Restoricon context and guardrails
 function buildRecruiterSystemPrompt(subcontractor, channel = 'sms', agentName = 'Aigentik', ownerName = 'the Restoricon management team') {
   const tradeSlug = subcontractor?.primary_trade ? normalizeTrade(subcontractor.primary_trade) || subcontractor.primary_trade : null;
   const tradeDisplay = tradeSlug ? getTradeDisplayName(tradeSlug) : 'residential construction';
@@ -596,7 +588,6 @@ function buildRecruiterSystemPrompt(subcontractor, channel = 'sms', agentName = 
   ].filter(Boolean).join('\n');
 }
 
-// Format detailed subcontractor profile summary
 function formatSubcontractorSummary(s) {
   if (!s) return 'Subcontractor not found.';
   const trade = s.primary_trade ? getTradeDisplayName(s.primary_trade) : 'Not specified';
@@ -623,9 +614,8 @@ function formatSubcontractorSummary(s) {
   ].filter(Boolean).join('\n');
 }
 
-// Format full pipeline report
-function formatPipelineReport() {
-  const list = loadSubcontractors();
+async function formatPipelineReport(subcontractors) {
+  const list = subcontractors || await loadSubcontractors();
   if (!list.length) return 'No subcontractors currently in the recruitment pipeline.';
 
   const counts = {};
@@ -651,7 +641,6 @@ function formatPipelineReport() {
     `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
   ];
 
-  // List recent active prospects
   const active = list.filter(s => s.qualification_status !== QUALIFICATION_STATUSES.DECLINED && s.qualification_status !== QUALIFICATION_STATUSES.DO_NOT_CONTACT).slice(0, 10);
   if (active.length) {
     lines.push('\nRecent Active Candidates:');
@@ -664,9 +653,8 @@ function formatPipelineReport() {
   return lines.join('\n');
 }
 
-// Format follow-up candidates list
-function formatFollowupList() {
-  const list = loadSubcontractors();
+async function formatFollowupList(subcontractors) {
+  const list = subcontractors || await loadSubcontractors();
   const followups = list.filter(s =>
     s.qualification_status === QUALIFICATION_STATUSES.FOLLOW_UP_REQUESTED ||
     s.qualification_status === QUALIFICATION_STATUSES.CONTACTED ||
@@ -690,6 +678,8 @@ export {
   RECRUITER_OBJECTIONS,
   OPENING_SCRIPT,
   FOLLOW_UP_TEMPLATES,
+  mapCoreToJS,
+  mapJSToCore,
   loadSubcontractors,
   saveSubcontractors,
   generateSubcontractorId,

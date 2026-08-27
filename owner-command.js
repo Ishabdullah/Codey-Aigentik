@@ -308,13 +308,13 @@ async function handleOwnerCommand(sms) {
 
   // Show subcontractor recruitment pipeline
   if (lower === 'pipeline' || lower === 'subcontractor pipeline' || lower === 'subcontractor leads' || lower === 'subcontractors') {
-    reply(recruiter.formatPipelineReport());
+    reply(await recruiter.formatPipelineReport());
     return;
   }
 
   // Show pending subcontractor follow-ups
   if (lower === 'subcontractor followups' || lower === 'sub followups' || lower === 'pending followups') {
-    reply(recruiter.formatFollowupList());
+    reply(await recruiter.formatFollowupList());
     return;
   }
 
@@ -1147,7 +1147,7 @@ Return ONLY JSON.`;
     }
 
     case 'list_subcontractor_pipeline': {
-      await reply(recruiter.formatPipelineReport());
+      await reply(await recruiter.formatPipelineReport());
       break;
     }
 
@@ -1171,7 +1171,7 @@ Return ONLY JSON.`;
         await reply(`Subcontractor "${target}" not found.`);
         break;
       }
-      const updated = await await recruiter.updateSubcontractor(sub.subcontractor_id, {
+      const updated = await recruiter.updateSubcontractor(sub.subcontractor_id, {
         qualification_status: recruiter.QUALIFICATION_STATUSES.QUALIFICATION_IN_PROGRESS
       });
       await reply(`🛠️ Qualification in progress for ${sub.company_name || sub.contact_name} [${sub.subcontractor_id}]. Next step: ${recruiter.determineNextRecruitmentStep(updated)}`);
@@ -1244,7 +1244,7 @@ Return ONLY JSON.`;
     }
 
     case 'list_subcontractor_followups': {
-      await reply(recruiter.formatFollowupList());
+      await reply(await recruiter.formatFollowupList());
       break;
     }
 

@@ -1,6 +1,4 @@
-// tests/subcontractor-recruiter.test.js — Unit tests for the Restoricon Subcontractor
-// Recruitment, Qualification, and Pipeline Management Module.
-
+import { jest } from '@jest/globals';
 import {
   TRADES,
   TRADE_DISPLAY_NAMES,
@@ -20,6 +18,13 @@ import {
   RECRUITER_OBJECTIONS,
   OPENING_SCRIPT,
   FOLLOW_UP_TEMPLATES,
+  mapCoreToJS,
+  mapJSToCore,
+  loadSubcontractors,
+  getSubcontractorById,
+  findSubcontractor,
+  createOrUpdateSubcontractorLead,
+  updateSubcontractor,
   getMissingDocuments,
   determineQualificationStatus,
   determineNextRecruitmentStep,
@@ -204,9 +209,181 @@ describe('Reporting & Summaries', () => {
     expect(summary).toContain('QUALIFIED_PENDING_DOCUMENTS');
   });
 
-  it('formats pipeline report for empty and active states', () => {
-    const report = formatPipelineReport();
-    expect(typeof report).toBe('string');
-    expect(report.length).toBeGreaterThan(0);
+  it('formats pipeline report for empty and active states', async () => {
+    const reportEmpty = await formatPipelineReport([]);
+    expect(typeof reportEmpty).toBe('string');
+    expect(reportEmpty).toContain('No subcontractors currently');
+
+    const reportActive = await formatPipelineReport([
+      {
+        subcontractor_id: 'sub_0001',
+        company_name: 'Apex Builders',
+        primary_trade: 'roofing',
+        qualification_status: QUALIFICATION_STATUSES.QUALIFIED_PENDING_DOCUMENTS
+      }
+    ]);
+    expect(reportActive).toContain('Apex Builders');
+    expect(reportActive).toContain('Total Subcontractors: 1');
+  });
+
+  it('formats follow-up list for empty and active states', async () => {
+    const followEmpty = await formatFollowupList([]);
+    expect(followEmpty).toContain('No pending subcontractor follow-ups');
+
+    const followActive = await formatFollowupList([
+      {
+        subcontractor_id: 'sub_0001',
+        company_name: 'Apex Builders',
+        primary_trade: 'roofing',
+        qualification_status: QUALIFICATION_STATUSES.CONTACTED,
+        last_contact: '2026-08-25T10:00:00Z'
+      }
+    ]);
+    expect(followActive).toContain('Apex Builders');
+    expect(followActive).toContain('sub_0001');
   });
 });
+
+describe('subcontractor-recruiter (Core write-through)', () => {
+  let fetchSpy;
+
+  beforeEach(() => {
+    fetchSpy = jest.spyOn(global, 'fetch');
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  function mockResponse(status, body) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body
+    };
+  }
+
+  describe('mapCoreToJS & mapJSToCore', () => {
+    it('correctly maps between Core Subcontractor and JS object', () => {
+      const core = {
+        id: 7,
+        external_id: 'sub_0007',
+        company_name: 'Acme Framing',
+        primary_trade: 'framing',
+        w9_received: 1,
+        msa_signed: 0,
+        coi_received: 1,
+        workers_comp: 0,
+        license_required: 1,
+        general_liability: 1,
+        last_contact_at: '2026-08-27T12:00:00.000Z'
+      };
+
+      const js = mapCoreToJS(core);
+      expect(js.subcontractor_id).toBe('sub_0007');
+      expect(js.id).toBe(7);
+      expect(js.w9_received).toBe(true);
+      expect(js.msa_signed).toBe(false);
+      expect(js.coi_received).toBe(true);
+      expect(js.workers_comp).toBe(false);
+      expect(js.last_contact).toBe('2026-08-27T12:00:00.000Z');
+
+      const backToCore = mapJSToCore(js);
+      expect(backToCore.external_id).toBe('sub_0007');
+      expect(backToCore.id).toBe(7);
+      expect(backToCore.w9_received).toBe(1);
+      expect(backToCore.msa_signed).toBe(0);
+      expect(backToCore.last_contact_at).toBe('2026-08-27T12:00:00.000Z');
+    });
+  });
+
+  describe('loadSubcontractors', () => {
+    it('fetches subcontractors from Core API', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        subcontractors: [
+          { id: 1, external_id: 'sub_0001', company_name: 'Elite Drywall', primary_trade: 'drywall' }
+        ]
+      }));
+
+      const list = await loadSubcontractors();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/subcontractors');
+      expect(list).toHaveLength(1);
+      expect(list[0].subcontractor_id).toBe('sub_0001');
+      expect(list[0].company_name).toBe('Elite Drywall');
+    });
+  });
+
+  describe('getSubcontractorById & findSubcontractor', () => {
+    it('finds subcontractor by query string', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        subcontractor: { id: 2, external_id: 'sub_0002', company_name: 'Apex Plumbing', phone: '8605551234' }
+      }));
+
+      const found = await findSubcontractor('8605551234');
+      expect(found.subcontractor_id).toBe('sub_0002');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0].searchParams.get('q')).toBe('8605551234');
+    });
+
+    it('gets subcontractor by numeric id', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        subcontractor: { id: 3, external_id: 'sub_0003', company_name: 'Pro Electric' }
+      }));
+
+      const found = await getSubcontractorById(3);
+      expect(found.id).toBe(3);
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/subcontractors/3');
+    });
+  });
+
+  describe('createOrUpdateSubcontractorLead', () => {
+    it('upserts a subcontractor lead via POST /api/v1/subcontractors/upsert', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        subcontractor: {
+          id: 10,
+          external_id: 'sub_0010',
+          company_name: 'New Contractor LLC',
+          primary_trade: 'roofing',
+          qualification_status: 'NEW_LEAD'
+        }
+      }));
+
+      const created = await createOrUpdateSubcontractorLead({
+        subcontractor_id: 'sub_0010',
+        company_name: 'New Contractor LLC',
+        primary_trade: 'roofing'
+      });
+
+      expect(created.subcontractor_id).toBe('sub_0010');
+      expect(created.id).toBe(10);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/subcontractors/upsert');
+    });
+  });
+
+  describe('updateSubcontractor', () => {
+    it('updates subcontractor record via Core API', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          subcontractor: { id: 5, external_id: 'sub_0005', company_name: 'Existing Sub' }
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          subcontractor: { id: 5, external_id: 'sub_0005', company_name: 'Existing Sub', primary_trade: 'painting' }
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          subcontractor: { id: 5, external_id: 'sub_0005', qualification_status: 'QUALIFIED_PENDING_DOCUMENTS' }
+        }));
+
+      const updated = await updateSubcontractor('sub_0005', {
+        primary_trade: 'painting',
+        qualification_status: 'QUALIFIED_PENDING_DOCUMENTS'
+      });
+
+      expect(updated.subcontractor_id).toBe('sub_0005');
+      expect(fetchSpy.mock.calls[1][0].pathname).toBe('/api/v1/subcontractors/5/update');
+      expect(fetchSpy.mock.calls[2][0].pathname).toBe('/api/v1/subcontractors/5/qualification');
+    });
+  });
+});
+
