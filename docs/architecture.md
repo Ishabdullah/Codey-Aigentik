@@ -145,7 +145,7 @@ A sender already routed to `owner-command.js` (an admin text/email — see above
 | `subcontractor-form.js` | Detects and deterministically parses "Subcontractor Application" lead-form emails into trade/license/insurance/crew/references |
 | `trades.js` | Canonical trade taxonomy and synonym normalization (e.g. "electrician" → `electrical`), shared by `contacts.js` and `subcontractor-form.js` |
 | `queue.js` | The review queue: add, fetch, edit, remove, format for display |
-| `do-not-contact.js` | The permanent contact-suppression list (`data/do-not-contact.json`): add/remove/lookup by email or phone, plus deterministic detection of opt-out phrases ("stop texting me", "remove me from your list") in an inbound message |
+| `do-not-contact.js` | The permanent contact-suppression list, stored in Restoricon Core (no local-JSON fallback since the B2 write-through cutover): add/remove/lookup by email or phone over the Core API, plus deterministic detection of opt-out phrases ("stop texting me", "remove me from your list") in an inbound message |
 | `tone.js` | Wraps `llama.js`'s tone detection with a fallback and tone-to-instruction mapping used in SMS reply prompts |
 | `logger.js` | Structured JSON file logging plus console mirroring |
 

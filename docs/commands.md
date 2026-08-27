@@ -84,7 +84,7 @@ Only one confirmation can be pending at a time; if you say anything other than y
 
 ## Do-not-contact list
 
-`do-not-contact.js` maintains a permanent block list at `data/do-not-contact.json` — like everything under `data/`, it's gitignored and never leaves this install. Anyone on it is never auto-replied to, queued, or messaged again on either channel (email or Google Voice), and no rule or per-contact `always` setting overrides it.
+`do-not-contact.js` maintains a permanent block list in Restoricon Core (as of the B2 write-through cutover, Core-only with no local-JSON fallback — see [Data files](data-files.md)). Anyone on it is never auto-replied to, queued, or messaged again on either channel (email or Google Voice), and no rule or per-contact `always` setting overrides it.
 
 Entries get added two ways:
 
