@@ -881,7 +881,7 @@ async function handleGoogleVoiceText(email) {
   }
 
   // Check rules
-  const { action } = smsRules.checkRules({
+  const { action } = await smsRules.checkRules({
     address: voiceMsg.sender_phone,
     body: voiceMsg.body
   });
@@ -1200,7 +1200,7 @@ async function handleNewEmail(email) {
     return;
   }
 
-  const { action } = emailRules.checkRules({
+  const { action } = await emailRules.checkRules({
     from: email.from_email,
     subject: email.subject,
     body: email.body

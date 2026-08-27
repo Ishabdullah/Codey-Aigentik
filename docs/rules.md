@@ -10,7 +10,7 @@ Two independent, structurally identical rule engines: `email-rules.js` for email
 **Google Voice conditions:** `from_number`, `message_contains`, `any`.
 **Google Voice actions:** `auto-reply`, `review`, `spam`.
 
-Every rule tracks its own `match_count` and `last_matched` timestamp, so `email rules` / `sms rules` shows you how often each one is actually firing.
+Every rule tracks its own `match_count`, so `email rules` / `sms rules` shows you how often each one is actually firing. (As of the B2 write-through cutover, rules live in Restoricon Core rather than local JSON files — see [Data files](data-files.md) — and Core's schema doesn't currently expose a separate `last_matched` timestamp field the way the pre-cutover local files did; `updated_at` is refreshed on every match, so the information isn't fully lost. See `NEW-231` in Codey-OS's `NEW_ISSUES.md`.)
 
 Add rules conversationally — `add email rule: auto-reply to anything from boss@company.com`, `add sms rule: spam messages containing "you've won"` — the model parses your description into the structured fields above. Remove them the same way: `remove rule [description or id]`. Full command list: [Owner command reference](commands.md).
 

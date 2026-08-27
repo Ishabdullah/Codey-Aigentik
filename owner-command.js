@@ -271,14 +271,14 @@ async function handleOwnerCommand(sms) {
 
   // List email rules
   if (lower === 'email rules' || lower === 'list email rules') {
-    reply(emailRules.listRulesForSms());
+    reply(await emailRules.listRulesForSms());
     return;
   }
 
   // List SMS rules
   if (lower === 'sms rules' || lower === 'list sms rules') {
     const smsRules = await import('./sms-rules.js');
-    reply(smsRules.listRulesForSms());
+    reply(await smsRules.listRulesForSms());
     return;
   }
 
@@ -596,9 +596,9 @@ Return ONLY JSON.`;
         const ruleData = JSON.parse(parsed.replace(/```json|```/g, '').trim());
         if (ruleType === 'sms') {
           const smsRules = await import('./sms-rules.js');
-          smsRules.addRule({ description: desc, ...ruleData, added_by: 'owner' });
+          await smsRules.addRule({ description: desc, ...ruleData, added_by: 'owner' });
         } else {
-          emailRules.addRule({ description: desc, ...ruleData, added_by: 'owner' });
+          await emailRules.addRule({ description: desc, ...ruleData, added_by: 'owner' });
         }
         reply(`✅ ${ruleType.toUpperCase()} rule added:\n"${desc}"\nAction: ${ruleData.action}`);
       } catch (e) {
@@ -615,9 +615,9 @@ Return ONLY JSON.`;
       let removed;
       if (ruleType === 'sms') {
         const smsRules = await import('./sms-rules.js');
-        removed = smsRules.removeRule(identifier);
+        removed = await smsRules.removeRule(identifier);
       } else {
-        removed = emailRules.removeRule(identifier);
+        removed = await emailRules.removeRule(identifier);
       }
 
       if (removed) {
@@ -632,10 +632,10 @@ Return ONLY JSON.`;
     case 'list_rules': {
       const type = cmd.rule_type || 'both';
       let msg = '';
-      if (type === 'email' || type === 'both') msg += emailRules.listRulesForSms() + '\n\n';
+      if (type === 'email' || type === 'both') msg += await emailRules.listRulesForSms() + '\n\n';
       if (type === 'sms' || type === 'both') {
         const smsRules = await import('./sms-rules.js');
-        msg += smsRules.listRulesForSms();
+        msg += await smsRules.listRulesForSms();
       }
       reply(msg.trim());
       break;

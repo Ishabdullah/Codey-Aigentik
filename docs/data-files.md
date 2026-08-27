@@ -9,8 +9,8 @@ Everything persistent lives under `data/` (configurable via `paths.data_dir` —
 | `contacts.json` | The [contact directory](contacts.md) |
 | `customers.json` | The [customer CRM](customer-crm.md) pipeline |
 | `subcontractors.json` | The [subcontractor recruitment](subcontractor-recruitment.md) pipeline |
-| `email-rules.json` | Saved email rules — see [Rule engines](rules.md) |
-| `sms-rules.json` | Saved Google Voice rules — see [Rule engines](rules.md) |
+| `email-rules.json` | No longer used as of the B2 write-through cutover — email rules are now stored in Restoricon Core's `automation_rules` table (`channel=email`) and fetched/mutated over the Core API. See [Rule engines](rules.md). |
+| `sms-rules.json` | No longer used as of the B2 write-through cutover — SMS rules are now stored in Restoricon Core's `automation_rules` table (`channel=sms`) and fetched/mutated over the Core API. See [Rule engines](rules.md). |
 | `calendar.json` | Appointment records — see [Appointment scheduling](scheduling.md) |
 | `schedule-config.json` | Working hours, appointment buffer, booking window, and per-relationship durations |
 | `pending.json` | The [review queue](commands.md#the-review-queue) |
