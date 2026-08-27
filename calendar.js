@@ -394,7 +394,7 @@ async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate
       const slotEnd = new Date(slotStart.getTime() + duration * 60 * 1000);
       if (slotStart > windowEnd) return null;
       if (isSlotAvailable(slotStart, slotEnd, cfg, appts, excludeId)) {
-        return { start, end: slotEnd };
+        return { start: slotStart, end: slotEnd };
       }
       slotStart = new Date(slotStart.getTime() + 15 * 60 * 1000);
     }

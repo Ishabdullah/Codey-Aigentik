@@ -358,4 +358,78 @@ describe('calendar (Core write-through)', () => {
       expect(fetchSpy.mock.calls[1][0].pathname).toBe('/api/v1/appointments/12/update');
     });
   });
+
+  describe('findNextAvailableSlot', () => {
+    const scheduleConfig = {
+      working_hours: {
+        mon: { start: '09:00', end: '17:00' },
+        tue: { start: '09:00', end: '17:00' },
+        wed: { start: '09:00', end: '17:00' },
+        thu: { start: '09:00', end: '17:00' },
+        fri: { start: '09:00', end: '17:00' }
+      },
+      buffer_minutes: 15,
+      default_duration_minutes: 30,
+      booking_window_days: 14
+    };
+
+    it('finds the next available slot without preferredDate when calendar is empty', async () => {
+      const afterDate = new Date('2026-08-31T08:00:00');
+      const slot = await calendar.findNextAvailableSlot({
+        afterDate,
+        durationMinutes: 30,
+        scheduleConfig,
+        appointments: []
+      });
+
+      expect(slot).not.toBeNull();
+      expect(slot.start).toBeInstanceOf(Date);
+      expect(slot.end).toBeInstanceOf(Date);
+      expect(slot.start.getHours()).toBe(9);
+      expect(slot.start.getMinutes()).toBe(0);
+      expect(slot.end.getHours()).toBe(9);
+      expect(slot.end.getMinutes()).toBe(30);
+    });
+
+    it('finds the next available slot without preferredDate when earlier slots are occupied', async () => {
+      const afterDate = new Date('2026-08-31T08:00:00');
+      const mockAppointments = [
+        {
+          id: 'appt_1',
+          status: 'confirmed',
+          start: new Date('2026-08-31T09:00:00').toISOString(),
+          end: new Date('2026-08-31T09:30:00').toISOString()
+        }
+      ];
+
+      const slot = await calendar.findNextAvailableSlot({
+        afterDate,
+        durationMinutes: 30,
+        scheduleConfig,
+        appointments: mockAppointments
+      });
+
+      expect(slot).not.toBeNull();
+      expect(slot.start.getHours()).toBe(9);
+      expect(slot.start.getMinutes()).toBe(45);
+      expect(slot.end.getHours()).toBe(10);
+      expect(slot.end.getMinutes()).toBe(15);
+    });
+
+    it('finds next available slot mid-day without preferredDate', async () => {
+      const afterDate = new Date('2026-08-31T11:20:00');
+      const slot = await calendar.findNextAvailableSlot({
+        afterDate,
+        durationMinutes: 30,
+        scheduleConfig,
+        appointments: []
+      });
+
+      expect(slot).not.toBeNull();
+      expect(slot.start.getHours()).toBe(11);
+      expect(slot.start.getMinutes()).toBe(30);
+      expect(slot.end.getHours()).toBe(12);
+      expect(slot.end.getMinutes()).toBe(0);
+    });
+  });
 });

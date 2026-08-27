@@ -939,13 +939,13 @@ Return ONLY JSON.`;
       }
 
       const preferredDate = calendarModule.parseDatetimePhrase(cmd.content);
-      const duration = calendarModule.getDurationForRelationship(contact.relationship);
+      const duration = await calendarModule.getDurationForRelationship(contact.relationship);
       // Never book same-day unless explicitly asked for today/tonight
       const afterDate = calendarModule.mentionsToday(cmd.content) ? undefined : calendarModule.startOfTomorrow();
-      const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate });
+      const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate });
       if (!slot) { reply('I couldn\'t find an open slot for that.'); break; }
 
-      const appt = calendarModule.createAppointment({
+      const appt = await calendarModule.createAppointment({
         title: `Appointment with ${contact.name || targetName}`,
         start: slot.start,
         end: slot.end,
