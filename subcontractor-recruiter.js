@@ -16,6 +16,82 @@ import {
 
 const SUBCONTRACTORS_FILE = path.join(config.paths?.data_dir || './data', 'subcontractors.json');
 
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('subcontractor-recruiter: config.core_api.base_url/token not configured');
+  }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('subcontractor-recruiter', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
+}
+
+// Explicit Mapping for Core API (NEW-245)
+// Core.external_id <-> JS.subcontractor_id
+// Core.id <-> JS.id
+// Core.last_contact_at <-> JS.last_contact
+// Core 1/0/null <-> JS boolean/null for: w9_received, msa_signed, coi_received, msa_sent, workers_comp, license_required, general_liability.
+function mapCoreToJS(coreObj) {
+  if (!coreObj) return null;
+  const jsObj = { ...coreObj };
+  jsObj.subcontractor_id = coreObj.external_id;
+  jsObj.id = coreObj.id;
+  jsObj.last_contact = coreObj.last_contact_at;
+  
+  const boolFields = ['w9_received', 'msa_signed', 'coi_received', 'msa_sent', 'workers_comp', 'license_required', 'general_liability'];
+  for (const field of boolFields) {
+    if (coreObj[field] === 1) jsObj[field] = true;
+    else if (coreObj[field] === 0) jsObj[field] = false;
+    else jsObj[field] = null;
+  }
+  return jsObj;
+}
+
+function mapJSToCore(jsObj) {
+  if (!jsObj) return null;
+  const coreObj = { ...jsObj };
+  coreObj.external_id = jsObj.subcontractor_id;
+  coreObj.id = jsObj.id;
+  coreObj.last_contact_at = jsObj.last_contact;
+  
+  const boolFields = ['w9_received', 'msa_signed', 'coi_received', 'msa_sent', 'workers_comp', 'license_required', 'general_liability'];
+  for (const field of boolFields) {
+    if (jsObj[field] === true) coreObj[field] = 1;
+    else if (jsObj[field] === false) coreObj[field] = 0;
+    else coreObj[field] = null;
+  }
+  return coreObj;
+}
+
+
 // Qualification Status Taxonomy
 const QUALIFICATION_STATUSES = {
   NEW_LEAD: 'NEW_LEAD',
@@ -190,163 +266,112 @@ function generateSubcontractorId(existing) {
 }
 
 // Get subcontractor by ID
-function getSubcontractorById(subcontractorId) {
+async function getSubcontractorById(subcontractorId) {
   if (!subcontractorId) return null;
-  const list = loadSubcontractors();
-  return list.find(s => s.subcontractor_id === subcontractorId) || null;
+  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: subcontractorId } });
+  if (ok && data?.subcontractor) {
+    return mapCoreToJS(data.subcontractor);
+  }
+  return null;
 }
 
 // Find subcontractor by phone, email, name, or business name
-function findSubcontractor(identifier) {
+async function findSubcontractor(identifier) {
   if (!identifier) return null;
-  const list = loadSubcontractors();
-  const q = String(identifier).toLowerCase().trim();
-  const cleanDigits = q.replace(/\D/g, '');
-
-  return list.find(s => {
-    if (s.subcontractor_id?.toLowerCase() === q) return true;
-    if (s.email?.toLowerCase() === q) return true;
-    if (s.company_name?.toLowerCase().includes(q)) return true;
-    if (s.legal_name?.toLowerCase().includes(q)) return true;
-    if (s.dba?.toLowerCase().includes(q)) return true;
-    if (s.contact_name?.toLowerCase().includes(q)) return true;
-    if (cleanDigits && cleanDigits.length >= 7) {
-      const pDigits = (s.phone || '').replace(/\D/g, '');
-      if (pDigits.includes(cleanDigits) || cleanDigits.includes(pDigits)) return true;
-    }
-    return false;
-  }) || null;
+  const { ok, data } = await coreRequest('GET', '/api/v1/subcontractors', { query: { q: identifier } });
+  if (ok && data?.subcontractor) {
+    return mapCoreToJS(data.subcontractor);
+  }
+  return null;
 }
 
-// Create or update a subcontractor record
-function createOrUpdateSubcontractorLead(data) {
-  const list = loadSubcontractors();
-  const existing = data.subcontractor_id
-    ? list.find(s => s.subcontractor_id === data.subcontractor_id)
-    : (data.phone || data.email || data.contact_name) ? findSubcontractor(data.phone || data.email || data.contact_name) : null;
-
+// Create or update a subcontractor record via Core API upsert (NEW-242 / NEW-245)
+async function createOrUpdateSubcontractorLead(data) {
   const now = new Date().toISOString();
 
-  if (existing) {
-    const idx = list.findIndex(s => s.subcontractor_id === existing.subcontractor_id);
-    const updated = {
-      ...existing,
-      ...data,
-      subcontractor_id: existing.subcontractor_id,
-      last_contact: now,
-      qualification_data: { ...(existing.qualification_data || {}), ...(data.qualification_data || {}) }
-    };
-
-    // Recalculate status if not explicitly overridden
-    if (!data.qualification_status) {
-      updated.qualification_status = determineQualificationStatus(updated);
+  let externalId = data.subcontractor_id;
+  if (!externalId) {
+    const existing = (data.phone || data.email || data.contact_name) ? await findSubcontractor(data.phone || data.email || data.contact_name) : null;
+    if (existing && existing.subcontractor_id) {
+      externalId = existing.subcontractor_id;
+    } else {
+      const list = loadSubcontractors();
+      externalId = generateSubcontractorId(list);
     }
-
-    list[idx] = updated;
-    saveSubcontractors(list);
-    syncWithContacts(updated);
-    log.info('subcontractor-recruiter', `Updated subcontractor: ${updated.company_name || updated.contact_name} (${updated.subcontractor_id})`);
-    return updated;
   }
 
-  const newId = generateSubcontractorId(list);
   const record = {
-    subcontractor_id: newId,
-    contact_id: data.contact_id || null,
-    company_name: data.company_name || null,
-    legal_name: data.legal_name || data.company_name || null,
-    dba: data.dba || null,
-    contact_name: data.contact_name || null,
-    title: data.title || null,
-    phone: data.phone || null,
-    email: data.email || null,
-    website: data.website || null,
-    primary_trade: data.primary_trade ? normalizeTrade(data.primary_trade) || data.primary_trade : null,
-    secondary_trades: Array.isArray(data.secondary_trades) ? data.secondary_trades : [],
-    service_area: data.service_area || null,
-    years_in_business: data.years_in_business != null ? data.years_in_business : null,
-    crew_size: data.crew_size != null ? data.crew_size : null,
-    residential_experience: data.residential_experience != null ? data.residential_experience : null,
-    commercial_experience: data.commercial_experience != null ? data.commercial_experience : null,
-    typical_project_size: data.typical_project_size || null,
-    availability: data.availability || null,
-    emergency_availability: data.emergency_availability != null ? data.emergency_availability : null,
-
-    // Licensing
-    license_required: data.license_required != null ? data.license_required : null,
-    license_type: data.license_type || null,
-    license_number: data.license_number || null,
-    license_expiration: data.license_expiration || null,
-    license_status: data.license_status || (data.license_number ? 'LICENSE_PENDING_VERIFICATION' : null),
-
-    // Insurance
-    general_liability: data.general_liability != null ? data.general_liability : null,
-    workers_comp: data.workers_comp != null ? data.workers_comp : null,
-    coi_received: data.coi_received != null ? data.coi_received : false,
-    coi_expiration: data.coi_expiration || null,
-    additional_insured_status: data.additional_insured_status || null,
-    insurance_status: data.insurance_status || (data.general_liability === false || data.workers_comp === false ? 'INSURANCE_REVIEW_REQUIRED' : (data.general_liability ? 'INSURANCE_PENDING' : null)),
-
-    // Documents
-    w9_received: data.w9_received != null ? data.w9_received : false,
-    msa_sent: data.msa_sent != null ? data.msa_sent : false,
-    msa_signed: data.msa_signed != null ? data.msa_signed : false,
-
-    // References & Portfolio
-    references: Array.isArray(data.references) ? data.references : [],
-    portfolio_url: data.portfolio_url || null,
-
-    // Status & Tracking
+    ...data,
+    subcontractor_id: externalId,
+    last_contact: now,
     qualification_status: data.qualification_status || QUALIFICATION_STATUSES.NEW_LEAD,
     recruitment_step: data.recruitment_step || RECRUITMENT_STEPS.OPENING,
     lead_source: data.lead_source || 'manual',
-    last_contact: now,
-    next_followup: data.next_followup || null,
     contact_attempts: data.contact_attempts || 1,
-    dnc_status: false,
-    notes: data.notes || null,
+    dnc_status: data.dnc_status || false,
     qualification_data: data.qualification_data || {}
   };
 
-  record.qualification_status = determineQualificationStatus(record);
-  list.push(record);
-  saveSubcontractors(list);
-  syncWithContacts(record);
-  log.info('subcontractor-recruiter', `Created new subcontractor lead: ${record.company_name || record.contact_name} (${record.subcontractor_id})`);
-  return record;
+  if (record.primary_trade) {
+    record.primary_trade = normalizeTrade(record.primary_trade) || record.primary_trade;
+  }
+
+  if (!data.qualification_status) {
+    record.qualification_status = determineQualificationStatus(record);
+  }
+
+  const mapped = mapJSToCore(record);
+  const { ok, data: resData, status } = await coreRequest('POST', '/api/v1/subcontractors/upsert', { body: mapped });
+
+  if (!ok) {
+    log.error('subcontractor-recruiter', 'Failed to upsert subcontractor', { status });
+    return null;
+  }
+
+  const finalRecord = resData?.subcontractor || mapCoreToJS(resData) || record;
+  syncWithContacts(finalRecord);
+  log.info('subcontractor-recruiter', `Upserted subcontractor lead: ${finalRecord.company_name || finalRecord.contact_name || finalRecord.subcontractor_id}`);
+  return finalRecord;
 }
 
 // Update an existing subcontractor by ID
-function updateSubcontractor(subcontractorId, updates) {
+async function updateSubcontractor(subcontractorId, updates) {
   if (!subcontractorId) return null;
-  const list = loadSubcontractors();
-  const idx = list.findIndex(s => s.subcontractor_id === subcontractorId);
-  if (idx === -1) return null;
+  
+  let numericId = updates.id;
+  if (!numericId) {
+    const existing = await getSubcontractorById(subcontractorId);
+    if (!existing) return null;
+    numericId = existing.id;
+    updates = { ...existing, ...updates, qualification_data: { ...(existing.qualification_data || {}), ...(updates.qualification_data || {}) } };
+  }
 
-  const current = list[idx];
-  const updated = {
-    ...current,
-    ...updates,
-    subcontractor_id: current.subcontractor_id,
-    last_contact: new Date().toISOString(),
-    qualification_data: { ...(current.qualification_data || {}), ...(updates.qualification_data || {}) }
-  };
-
+  updates.last_contact = new Date().toISOString();
   if (updates.primary_trade) {
-    updated.primary_trade = normalizeTrade(updates.primary_trade) || updates.primary_trade;
+    updates.primary_trade = normalizeTrade(updates.primary_trade) || updates.primary_trade;
   }
 
-  // Ensure strict safety: NEVER set APPROVED_ONBOARDING / ONBOARDING_COMPLETE automatically
   if (!updates.qualification_status) {
-    updated.qualification_status = determineQualificationStatus(updated);
+    updates.qualification_status = determineQualificationStatus(updates);
   }
 
-  list[idx] = updated;
-  saveSubcontractors(list);
-  syncWithContacts(updated);
-  return updated;
-}
+  const mapped = mapJSToCore(updates);
+  const { ok, status } = await coreRequest('POST', `/api/v1/subcontractors/${numericId}/update`, { body: mapped });
+  
+  if (!ok) {
+    log.error('subcontractor-recruiter', 'Failed to update subcontractor', { status });
+    return null;
+  }
 
+  if (updates.qualification_status) {
+     await coreRequest('POST', `/api/v1/subcontractors/${numericId}/qualification`, { 
+       body: { qualification_status: updates.qualification_status } 
+     });
+  }
+
+  syncWithContacts(updates);
+  return updates;
+}
 // Synchronize subcontractor record with contacts.json
 function syncWithContacts(subcontractor) {
   try {

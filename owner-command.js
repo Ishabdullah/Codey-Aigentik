@@ -837,7 +837,7 @@ Return ONLY JSON.`;
       });
 
       // Also record in the recruiter pipeline
-      const sub = recruiter.createOrUpdateSubcontractorLead({
+      const sub = await recruiter.createOrUpdateSubcontractorLead({
         contact_id: contact.id,
         company_name: extracted.business_name || targetName,
         contact_name: targetName,
@@ -1154,7 +1154,7 @@ Return ONLY JSON.`;
     case 'show_subcontractor_profile': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor? Give a name, trade, or ID."); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`No subcontractor found matching "${target}".`);
       } else {
@@ -1166,12 +1166,12 @@ Return ONLY JSON.`;
     case 'qualify_subcontractor': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor do you want to qualify?"); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`Subcontractor "${target}" not found.`);
         break;
       }
-      const updated = recruiter.updateSubcontractor(sub.subcontractor_id, {
+      const updated = await await recruiter.updateSubcontractor(sub.subcontractor_id, {
         qualification_status: recruiter.QUALIFICATION_STATUSES.QUALIFICATION_IN_PROGRESS
       });
       await reply(`🛠️ Qualification in progress for ${sub.company_name || sub.contact_name} [${sub.subcontractor_id}]. Next step: ${recruiter.determineNextRecruitmentStep(updated)}`);
@@ -1181,12 +1181,12 @@ Return ONLY JSON.`;
     case 'approve_subcontractor': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor do you want to approve?"); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`Subcontractor "${target}" not found.`);
         break;
       }
-      recruiter.updateSubcontractor(sub.subcontractor_id, {
+      await recruiter.updateSubcontractor(sub.subcontractor_id, {
         qualification_status: recruiter.QUALIFICATION_STATUSES.APPROVED_ONBOARDING
       });
       await reply(`✅ Approved onboarding for ${sub.company_name || sub.contact_name} [${sub.subcontractor_id}]. Status set to APPROVED_ONBOARDING.`);
@@ -1197,12 +1197,12 @@ Return ONLY JSON.`;
     case 'decline_subcontractor': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor do you want to decline?"); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`Subcontractor "${target}" not found.`);
         break;
       }
-      recruiter.updateSubcontractor(sub.subcontractor_id, {
+      await recruiter.updateSubcontractor(sub.subcontractor_id, {
         qualification_status: recruiter.QUALIFICATION_STATUSES.DECLINED
       });
       await reply(`🛑 Marked ${sub.company_name || sub.contact_name} [${sub.subcontractor_id}] as DECLINED.`);
@@ -1213,13 +1213,13 @@ Return ONLY JSON.`;
     case 'request_subcontractor_docs': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor needs document requests?"); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`Subcontractor "${target}" not found.`);
         break;
       }
       const missing = recruiter.getMissingDocuments(sub);
-      recruiter.updateSubcontractor(sub.subcontractor_id, {
+      await recruiter.updateSubcontractor(sub.subcontractor_id, {
         qualification_status: recruiter.QUALIFICATION_STATUSES.DOCUMENTS_REQUESTED
       });
       await reply(`📄 Document request flagged for ${sub.company_name || sub.contact_name} [${sub.subcontractor_id}].\nMissing: ${missing.join(', ')}`);
@@ -1229,7 +1229,7 @@ Return ONLY JSON.`;
     case 'list_subcontractor_missing_docs': {
       const target = cmd.target;
       if (!target) { await reply("Which subcontractor?"); break; }
-      const sub = recruiter.findSubcontractor(target);
+      const sub = await recruiter.findSubcontractor(target);
       if (!sub) {
         await reply(`Subcontractor "${target}" not found.`);
         break;

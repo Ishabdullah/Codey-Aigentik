@@ -105,7 +105,7 @@ const AMBIGUOUS_PATTERNS = [
 // 2. IDENTITY & PERSON RESOLUTION
 // ==========================================
 
-export function resolvePersonAndRoles({
+export async function resolvePersonAndRoles({
   phone,
   email,
   name
@@ -116,9 +116,9 @@ export function resolvePersonAndRoles({
                   (name ? contacts.findContact(name) : null);
 
   // Look up CRM entities
-  const subRecord = recruiter.findSubcontractor(phone) ||
-                    (email ? recruiter.findSubcontractor(email) : null) ||
-                    (contact?.id ? recruiter.findSubcontractor(contact.id) : null);
+  const subRecord = (await recruiter.findSubcontractor(phone)) ||
+                    (email ? await recruiter.findSubcontractor(email) : null) ||
+                    (contact?.id ? await recruiter.findSubcontractor(contact.id) : null);
 
   const custRecord = customerModule.findCustomer(phone) ||
                      (email ? customerModule.findCustomer(email) : null) ||

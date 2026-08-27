@@ -767,7 +767,7 @@ async function handleSubcontractorApplication(email) {
   });
 
   // Record in Restoricon recruitment pipeline
-  const subLead = recruiter.createOrUpdateSubcontractorLead({
+  const subLead = await recruiter.createOrUpdateSubcontractorLead({
     contact_id: contact.id,
     company_name: parsed.business_name,
     legal_name: parsed.business_name,
@@ -913,7 +913,7 @@ async function handleGoogleVoiceText(email) {
     const upcomingAppt = contact?.id ? calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
     const appointmentContext = upcomingAppt ? calendarModule.formatAppointment(upcomingAppt) : null;
 
-    const person = roleRouter.resolvePersonAndRoles({
+    const person = await roleRouter.resolvePersonAndRoles({
       phone: voiceMsg.sender_phone,
       name: voiceMsg.sender_name
     });
@@ -946,7 +946,7 @@ async function handleGoogleVoiceText(email) {
 
       let currentSub = person.subcontractor_record;
       if (!currentSub) {
-        currentSub = recruiter.createOrUpdateSubcontractorLead({
+        currentSub = await recruiter.createOrUpdateSubcontractorLead({
           contact_id: contact?.id,
           contact_name: voiceMsg.sender_name,
           phone: voiceMsg.sender_phone,
@@ -956,7 +956,7 @@ async function handleGoogleVoiceText(email) {
           ...extracted
         });
       } else if (Object.keys(extracted).length > 0) {
-        currentSub = recruiter.updateSubcontractor(currentSub.subcontractor_id, extracted);
+        currentSub = await recruiter.updateSubcontractor(currentSub.subcontractor_id, extracted);
       }
 
       reply = await llama.generateRecruiterReply({
@@ -1240,7 +1240,7 @@ async function handleNewEmail(email) {
     const upcomingApptEmail = contact?.id ? calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
     const appointmentContext = upcomingApptEmail ? calendarModule.formatAppointment(upcomingApptEmail) : null;
 
-    const person = roleRouter.resolvePersonAndRoles({
+    const person = await roleRouter.resolvePersonAndRoles({
       email: email.from_email,
       name: email.from_name
     });
@@ -1277,7 +1277,7 @@ async function handleNewEmail(email) {
 
       let currentSub = person.subcontractor_record;
       if (!currentSub) {
-        currentSub = recruiter.createOrUpdateSubcontractorLead({
+        currentSub = await recruiter.createOrUpdateSubcontractorLead({
           contact_id: contact?.id,
           contact_name: email.from_name,
           email: email.from_email,
@@ -1287,7 +1287,7 @@ async function handleNewEmail(email) {
           ...extracted
         });
       } else if (Object.keys(extracted).length > 0) {
-        currentSub = recruiter.updateSubcontractor(currentSub.subcontractor_id, extracted);
+        currentSub = await recruiter.updateSubcontractor(currentSub.subcontractor_id, extracted);
       }
 
       reply = await llama.generateRecruiterReply({

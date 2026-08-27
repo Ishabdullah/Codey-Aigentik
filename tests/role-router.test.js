@@ -1,5 +1,6 @@
 // tests/role-router.test.js — Complete Test Suite for Aigentik Dynamic Role & Identity Routing Engine
 
+import { jest } from '@jest/globals';
 import {
   ROLES,
   WORKFLOWS,
@@ -11,14 +12,27 @@ import {
 } from '../role-router.js';
 
 describe('Aigentik Dynamic Role & Identity Routing Engine', () => {
+  let fetchSpy;
+
+  beforeEach(() => {
+    fetchSpy = jest.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'Not found' })
+    }));
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
 
   describe('Section 1 & 2: Identity Resolution & Concept Separation', () => {
     // Admin senders never reach role-router: index.js intercepts a Google
     // Voice text from admin_number or an email from admin_email and routes
     // it to owner-command.js before this module runs, so there is no
     // admin-detection path here to test.
-    it('resolves new contacts with clean Person and Organization structures', () => {
-      const person = resolvePersonAndRoles({
+    it('resolves new contacts with clean Person and Organization structures', async () => {
+      const person = await resolvePersonAndRoles({
         phone: '860-555-1234',
         name: 'Jane Smith'
       });
@@ -32,7 +46,7 @@ describe('Aigentik Dynamic Role & Identity Routing Engine', () => {
   describe('Section 18: Mandatory Test Cases (1 to 10)', () => {
 
     it('TEST 1: New person: "I need a bathroom remodel." -> CUSTOMER', async () => {
-      const person = resolvePersonAndRoles({ phone: '860-555-0001' });
+      const person = await resolvePersonAndRoles({ phone: '860-555-0001' });
 
       const result = await detectRoleAndIntent({
         message: 'I need a bathroom remodel.',
@@ -45,7 +59,7 @@ describe('Aigentik Dynamic Role & Identity Routing Engine', () => {
     });
 
     it('TEST 2: New person: "I own a plumbing company and want to work with Restoricon." -> SUBCONTRACTOR', async () => {
-      const person = resolvePersonAndRoles({ phone: '860-555-0002' });
+      const person = await resolvePersonAndRoles({ phone: '860-555-0002' });
 
       const result = await detectRoleAndIntent({
         message: 'I own a plumbing company and want to work with Restoricon.',
