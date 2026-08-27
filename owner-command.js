@@ -96,12 +96,14 @@ async function handleBlockContact(target, reason, customReply) {
     await replyFn(`I couldn't find an email or phone for "${target}". Try the exact email or phone number.`);
     return;
   }
-  identifiers.forEach(id => doNotContact.addToDoNotContact({
-    identifier: id,
-    name: target.includes('@') || /\d{7,}/.test(target) ? null : target,
-    reason: reason || 'blocked by owner',
-    source: 'owner'
-  }));
+  for (const id of identifiers) {
+    await doNotContact.addToDoNotContact({
+      identifier: id,
+      name: target.includes('@') || /\d{7,}/.test(target) ? null : target,
+      reason: reason || 'blocked by owner',
+      source: 'owner'
+    });
+  }
   await replyFn(`🚫 Blocked ${target} — ${identifiers.join(', ')}. I will never contact them again.`);
   log.action('owner-command', `Owner blocked: ${target}`, { identifiers });
 }
@@ -111,7 +113,10 @@ async function handleUnblockContact(target, customReply) {
   if (!target) { await replyFn('Who should I unblock?'); return; }
   const identifiers = resolveIdentifiers(target);
   const candidates = identifiers.length ? identifiers : [target];
-  const removed = candidates.filter(id => doNotContact.removeFromDoNotContact(id));
+  const removed = [];
+  for (const id of candidates) {
+    if (await doNotContact.removeFromDoNotContact(id)) removed.push(id);
+  }
   if (removed.length === 0) {
     await replyFn(`"${target}" isn't on the do-not-contact list.`);
     return;
@@ -297,7 +302,7 @@ async function handleOwnerCommand(sms) {
 
   // Show the do-not-contact list
   if (lower === 'blocked' || lower === 'do not contact list' || lower === 'dnc list' || lower === 'dnc') {
-    reply(doNotContact.listDoNotContact());
+    reply(await doNotContact.listDoNotContact());
     return;
   }
 
@@ -376,7 +381,7 @@ async function handleOwnerCommand(sms) {
       return;
     }
 
-    if (doNotContact.isBlocked(exactMatch.emails[0])) {
+    if (await doNotContact.isBlocked(exactMatch.emails[0])) {
       await reply('🚫 ' + (exactMatch.name || target) + ' (' + exactMatch.emails[0] + ') is on your do-not-contact list — I won\'t send this.');
       return;
     }
@@ -509,7 +514,7 @@ async function executeInterpretedCommand(cmd, originalText, name) {
       const item = queue.getItem(id);
       if (!item) { reply(`Item #${id} not found.`); break; }
 
-      if (doNotContact.isBlocked(item.sender)) {
+      if (await doNotContact.isBlocked(item.sender)) {
         reply(`🚫 ${item.sender_name || item.sender} is on your do-not-contact list — I won't send this. Say "skip ${id}" to dismiss it, or "unblock ${item.sender_name || item.sender}" if that's wrong.`);
         break;
       }
@@ -659,7 +664,7 @@ Return ONLY JSON.`;
         break;
       }
 
-      if (doNotContact.isBlocked(toEmail)) {
+      if (await doNotContact.isBlocked(toEmail)) {
         reply(`🚫 ${toName} (${toEmail}) is on your do-not-contact list — I won't send this. Say "unblock ${toName}" if that's wrong.`);
         break;
       }
@@ -1326,7 +1331,7 @@ Return ONLY JSON.`;
     }
 
     case 'list_do_not_contact':
-      reply(doNotContact.listDoNotContact());
+      reply(await doNotContact.listDoNotContact());
       break;
 
     case 'switch_ai_provider': {

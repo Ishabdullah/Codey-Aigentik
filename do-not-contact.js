@@ -1,15 +1,22 @@
 // do-not-contact.js — permanent contact suppression list
 // Anyone added here is never auto-replied to, queued, or messaged again by
-// Aigentik, on either channel (email or Google Voice/SMS). Stored under
-// data/ like every other runtime file, so it's gitignored and stays local
-// to this install — never pushed to GitHub.
-
-import fs from 'fs';
-import path from 'path';
+// Aigentik, on either channel (email or Google Voice/SMS).
+//
+// B2 task 4 write-through pilot (2026-08-27): this module used to store
+// entries in a local data/do-not-contact.json file. It now writes through
+// to Restoricon Core's /api/v1/do-not-contact* routes instead — Core is the
+// single source of truth, Core-only, with no local-JSON fallback. That's a
+// deliberate decision, not an oversight: a defensive fallback where a failed
+// Core write silently degrades to a local-only write would mean isBlocked()
+// checks against Core could miss an entry only the local file knows about —
+// silently failing the one thing this list exists to guarantee (never
+// re-contacting someone who opted out). So a failed Core call surfaces as a
+// thrown error to the caller instead. See CODEY_MASTER_PLAN.md §6.4 task 4.
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 
-const DNC_FILE = path.join(config.paths.data_dir, 'do-not-contact.json');
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
 
 // Deterministic phrase match for "stop contacting me" style requests — kept
 // out of the LLM (same reasoning as calendar.js's date parsing) so a block
@@ -29,23 +36,50 @@ const OPT_OUT_PHRASES = [
   'remove my number', 'remove my email', 'stop reaching out'
 ];
 
-function loadEntries() {
-  try {
-    if (fs.existsSync(DNC_FILE)) {
-      return JSON.parse(fs.readFileSync(DNC_FILE, 'utf8'));
+// Single choke point for every Core do-not-contact call — resolves the base
+// URL/token from config.core_api (Codey-Aigentik's own config-loading
+// convention, same static import every other write-site module uses) and
+// throws on any non-2xx response or network failure rather than swallowing
+// it, per the Core-only decision above.
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('do-not-contact: config.core_api.base_url/token not configured');
+  }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
     }
-  } catch (e) {
-    log.warn('do-not-contact', 'Could not load do-not-contact file', { error: e.message });
   }
-  return [];
-}
-
-function saveEntries(entries) {
+  let response;
   try {
-    fs.writeFileSync(DNC_FILE, JSON.stringify(entries, null, 2));
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
   } catch (e) {
-    log.error('do-not-contact', 'Failed to save do-not-contact file', { error: e.message });
+    log.error('do-not-contact', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
   }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    // A non-JSON/empty body is possible from a misbehaving server on
+    // either a success or error status. Left as `data: null` here rather
+    // than swallowed, specifically so a 2xx with an unparseable body still
+    // surfaces as a clear thrown error from each caller below (via the
+    // `parseError` check) instead of an opaque "Cannot read properties of
+    // null" from blindly indexing into `data`.
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
 }
 
 function normalizePhone(phone) {
@@ -70,56 +104,69 @@ function classifyIdentifier(identifier) {
   return null;
 }
 
-// True if this email address or phone number is on the do-not-contact list
-function isBlocked(identifier) {
+// Full list of do-not-contact entries from Core. Kept as its own exported
+// function (matching the pre-write-through shape) even though nothing
+// outside this module currently calls it directly.
+async function loadEntries() {
+  const { ok, status, data, parseError } = await coreRequest('GET', '/api/v1/do-not-contact');
+  if (!ok) throw new Error(`Core do-not-contact list failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  return data.do_not_contact || [];
+}
+
+// True if this email address or phone number is on the do-not-contact list.
+// Classified client-side first (same as before the write-through change) so
+// an unclassifiable identifier is rejected without a network round trip —
+// Core's own is_blocked() can't distinguish "not on the list" from
+// "malformed input" (NEW-221), so this client-side gate is load-bearing,
+// not just an optimization.
+async function isBlocked(identifier) {
   if (!identifier) return false;
   const classified = classifyIdentifier(identifier);
   if (!classified) return false;
-  const entries = loadEntries();
-  return entries.some(e => e.type === classified.type && e.value === classified.value);
+  const { ok, status, data, parseError } = await coreRequest('GET', '/api/v1/do-not-contact/check', {
+    query: { identifier }
+  });
+  if (!ok) throw new Error(`Core do-not-contact check failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  return !!data.blocked;
 }
 
 // Add an identifier (email or phone) to the permanent block list. Idempotent
-// — re-adding an existing entry just refreshes the reason/timestamp.
-function addToDoNotContact({ identifier, name, reason, source }) {
+// — re-adding an existing entry just refreshes the reason/timestamp (Core's
+// add_to_do_not_contact() upserts by type+value).
+async function addToDoNotContact({ identifier, name, reason, source }) {
   const classified = classifyIdentifier(identifier);
   if (!classified) return null;
 
-  const entries = loadEntries();
-  const idx = entries.findIndex(e => e.type === classified.type && e.value === classified.value);
+  const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/do-not-contact', {
+    body: {
+      identifier,
+      name: name || null,
+      reason: reason || 'requested removal',
+      source: source || 'auto'
+    }
+  });
+  if (status === 400) return null; // Core rejected it as unclassifiable — matches the pre-existing null return
+  if (!ok) throw new Error(`Core do-not-contact add failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
 
-  const entry = {
-    type: classified.type,
-    value: classified.value,
-    original: identifier,
-    name: name || (idx !== -1 ? entries[idx].name : null) || null,
-    reason: reason || 'requested removal',
-    source: source || 'auto',
-    added_at: new Date().toISOString()
-  };
-
-  if (idx !== -1) entries[idx] = entry;
-  else entries.push(entry);
-
-  saveEntries(entries);
-  log.action('do-not-contact', `Added to do-not-contact: ${classified.value}`, { reason: entry.reason, source: entry.source });
+  const entry = data.do_not_contact;
+  log.action('do-not-contact', `Added to do-not-contact: ${entry.value}`, { reason: entry.reason, source: entry.source });
   return entry;
 }
 
-function removeFromDoNotContact(identifier) {
+async function removeFromDoNotContact(identifier) {
   const classified = classifyIdentifier(identifier);
   if (!classified) return false;
-  const entries = loadEntries();
-  const idx = entries.findIndex(e => e.type === classified.type && e.value === classified.value);
-  if (idx === -1) return false;
-  entries.splice(idx, 1);
-  saveEntries(entries);
-  log.action('do-not-contact', `Removed from do-not-contact: ${classified.value}`);
-  return true;
+  const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/do-not-contact/remove', {
+    body: { identifier }
+  });
+  if (!ok) throw new Error(`Core do-not-contact remove failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  const removed = !!data.removed;
+  if (removed) log.action('do-not-contact', `Removed from do-not-contact: ${classified.value}`);
+  return removed;
 }
 
-function listDoNotContact() {
-  const entries = loadEntries();
+async function listDoNotContact() {
+  const entries = await loadEntries();
   if (entries.length === 0) return '🚫 Do-not-contact list is empty.';
   const lines = entries.map((e, i) =>
     `${i + 1}. ${e.name ? e.name + ' — ' : ''}${e.original} (${e.reason})`
@@ -127,7 +174,8 @@ function listDoNotContact() {
   return `🚫 Do-Not-Contact list (${entries.length}):\n` + lines.join('\n');
 }
 
-// Deterministic keyword check for opt-out language in an inbound message
+// Deterministic keyword check for opt-out language in an inbound message.
+// Pure, no I/O — unchanged by the write-through cutover.
 function detectOptOutRequest(text) {
   if (!text) return false;
   const lower = text.toLowerCase();

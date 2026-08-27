@@ -275,6 +275,17 @@ else
         data_dir: '$DATA_DIR',
         logs_dir: '$DATA_DIR/logs',
         conversations_dir: '$DATA_DIR/conversations'
+      },
+      core_api: {
+        // do-not-contact.js writes through to Restoricon Core's
+        // /api/v1/do-not-contact* routes (no local-file fallback) --
+        // base_url/token here must point at a running Core API instance
+        // and a real ai_agent-role bearer token, or every do-not-contact
+        // operation will fail (by design, see do-not-contact.js's own
+        // header comment). Generate the token with, from the Codey-OS
+        // checkout: python -m tools.provision_ai_agent_auth
+        base_url: 'http://127.0.0.1:8770',
+        token: 'REPLACE_WITH_A_REAL_AI_AGENT_TOKEN'
       }
     };
     fs.writeFileSync('$CONFIG_PATH', JSON.stringify(cfg, null, 2));
@@ -317,6 +328,10 @@ echo "     - gmail.email / gmail.app_password  → from step 1"
 echo "     - owner.admin_number / admin_number_formatted → your phone number"
 echo "     - owner.aigentik_number / aigentik_number_formatted → the Google Voice number"
 echo "     - owner.admin_email → your personal email (treated like admin_number for commands)"
+echo "     - core_api.token → a real ai_agent-role bearer token from the Restoricon Core"
+echo "       this install writes do-not-contact data to. From the Codey-OS checkout:"
+echo "       python -m tools.provision_ai_agent_auth"
+echo "       core_api.base_url must point at that Core API instance (default :8770)."
 echo "     See docs/configuration.md for every field."
 echo ""
 if [ "$IS_TERMUX" = "1" ]; then

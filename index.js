@@ -62,7 +62,7 @@ function stripQuotedReply(text) {
 async function checkDoNotContact({ identifier, name, text, channel }) {
   if (!identifier) return false;
 
-  if (doNotContact.isBlocked(identifier)) {
+  if (await doNotContact.isBlocked(identifier)) {
     log.action('index', `Blocked contact reached out again: ${identifier}`, { channel });
     await gmail.sendOwnerNotification(
       `🚫 Do-Not-Contact: ${name ? name + ' (' + identifier + ')' : identifier} messaged you again via ${channel}, ` +
@@ -72,7 +72,7 @@ async function checkDoNotContact({ identifier, name, text, channel }) {
   }
 
   if (doNotContact.detectOptOutRequest(text)) {
-    const entry = doNotContact.addToDoNotContact({
+    const entry = await doNotContact.addToDoNotContact({
       identifier,
       name,
       reason: 'asked to be removed/stopped contacting',
@@ -749,7 +749,7 @@ async function handleSchedulingMessage({ text, contact, channel, target, subject
 // subcontractor-specific reply (never the customer auto-reply prompt), and
 // give the admin the full application in one notification.
 async function handleSubcontractorApplication(email) {
-  if (doNotContact.isBlocked(email.from_email)) {
+  if (await doNotContact.isBlocked(email.from_email)) {
     log.action('index', `Blocked contact sent a subcontractor application: ${email.from_email}`);
     await gmail.sendOwnerNotification(
       `🚫 Do-Not-Contact: ${email.from_email} submitted a subcontractor application, but they're on your do-not-contact list — no acknowledgment was sent.`
@@ -1012,10 +1012,10 @@ async function handleGoogleVoiceText(email) {
         
         reply = "I understand you're frustrated, but please maintain a professional tone. I am escalating this to a live representative who will contact you as soon as they are available.";
         
-        doNotContact.addToDoNotContact({ 
-          identifier: voiceMsg.sender_phone, 
-          name: voiceMsg.sender_name || currentCust.customer_name, 
-          reason: 'Swearing / Escalated to Admin' 
+        await doNotContact.addToDoNotContact({
+          identifier: voiceMsg.sender_phone,
+          name: voiceMsg.sender_name || currentCust.customer_name,
+          reason: 'Swearing / Escalated to Admin'
         });
       } else {
         if (isEmergency) {
@@ -1344,10 +1344,10 @@ async function handleNewEmail(email) {
         
         reply = "I understand you're frustrated, but please maintain a professional tone. I am escalating this to a live representative who will contact you as soon as they are available.";
         
-        doNotContact.addToDoNotContact({ 
-          identifier: email.from_email, 
-          name: email.from_name || currentCust.customer_name, 
-          reason: 'Swearing / Escalated to Admin' 
+        await doNotContact.addToDoNotContact({
+          identifier: email.from_email,
+          name: email.from_name || currentCust.customer_name,
+          reason: 'Swearing / Escalated to Admin'
         });
       } else {
         if (isEmergency) {
