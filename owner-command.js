@@ -971,7 +971,7 @@ Return ONLY JSON.`;
       const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
       if (!contact) { reply(`Contact "${targetName}" not found.`); break; }
 
-      const appts = calendarModule.findAppointmentsByContact(contact.id);
+      const appts = await calendarModule.findAppointmentsByContact(contact.id);
       if (appts.length === 0) { reply(`No appointment on file for ${contact.name || targetName}.`); break; }
       const appt = appts.sort((a, b) => new Date(a.start) - new Date(b.start))[0];
 
@@ -980,10 +980,10 @@ Return ONLY JSON.`;
 
       const duration = (new Date(appt.end) - new Date(appt.start)) / 60000;
       const afterDate = calendarModule.mentionsToday(cmd.content) ? undefined : calendarModule.startOfTomorrow();
-      const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate, excludeId: appt.id });
+      const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate, excludeId: appt.id });
       if (!slot) { reply('That time isn\'t available and I couldn\'t find a nearby opening.'); break; }
 
-      const updated = calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
+      const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
       if (gmail && updated.attendee_email) {
         await gmail.sendCalendarInvite(updated, updated.attendee_email);
         await gmail.sendCalendarInvite(updated, config.owner?.admin_email || config.gmail.email);
@@ -1000,13 +1000,13 @@ Return ONLY JSON.`;
       const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
       if (!contact) { reply(`Contact "${targetName}" not found.`); break; }
 
-      const appts = calendarModule.findAppointmentsByContact(contact.id);
+      const appts = await calendarModule.findAppointmentsByContact(contact.id);
       if (appts.length === 0) { reply(`No appointment on file for ${contact.name || targetName}.`); break; }
       const appt = appts.sort((a, b) => new Date(a.start) - new Date(b.start))[0];
 
       pendingConfirmations.set('pending', {
         execute: async () => {
-          calendarModule.cancelAppointment(appt.id);
+          await calendarModule.cancelAppointment(appt.id);
           if (gmail) {
             if (appt.attendee_email) await gmail.sendCalendarCancellation(appt, appt.attendee_email);
             await gmail.sendCalendarCancellation(appt, config.owner?.admin_email || config.gmail.email);
@@ -1022,19 +1022,19 @@ Return ONLY JSON.`;
     case 'list_appointments': {
       const content = (cmd.content || '').toLowerCase().trim();
       if (!content) {
-        reply(calendarModule.listUpcomingForSms());
+        reply(await calendarModule.listUpcomingForSms());
       } else if (content.includes('today')) {
-        reply(calendarModule.listForDateForSms(new Date()));
+        reply(await calendarModule.listForDateForSms(new Date()));
       } else if (content.includes('this week')) {
-        reply(calendarModule.listUpcomingForSms(7));
+        reply(await calendarModule.listUpcomingForSms(7));
       } else if (content.includes('next week')) {
-        reply(calendarModule.listUpcomingForSms(14));
+        reply(await calendarModule.listUpcomingForSms(14));
       } else if (content.includes('month')) {
-        reply(calendarModule.listUpcomingForSms(30));
+        reply(await calendarModule.listUpcomingForSms(30));
       } else {
         // A specific date, e.g. "tomorrow", "next tuesday", "august 5th"
         const date = calendarModule.parseDatetimePhrase(content);
-        reply(date ? calendarModule.listForDateForSms(date) : calendarModule.listUpcomingForSms());
+        reply(date ? await calendarModule.listForDateForSms(date) : await calendarModule.listUpcomingForSms());
       }
       break;
     }
@@ -1042,16 +1042,16 @@ Return ONLY JSON.`;
     case 'set_working_hours': {
       const parsed = calendarModule.parseWorkingHoursPhrase(cmd.content);
       if (parsed) {
-        calendarModule.setWorkingHours(parsed.days, parsed.start, parsed.end);
-        reply(`✅ Working hours updated:\n${calendarModule.formatWorkingHours()}`);
+        await calendarModule.setWorkingHours(parsed.days, parsed.start, parsed.end);
+        reply(`✅ Working hours updated:\n${await calendarModule.formatWorkingHours()}`);
         log.action('owner-command', `Working hours set: ${JSON.stringify(parsed)}`);
         break;
       }
 
       const offDays = calendarModule.parseDayOffPhrase(cmd.content);
       if (offDays) {
-        calendarModule.setDayOff(offDays);
-        reply(`✅ Marked off: ${offDays.join(', ')}.\n${calendarModule.formatWorkingHours()}`);
+        await calendarModule.setDayOff(offDays);
+        reply(`✅ Marked off: ${offDays.join(', ')}.\n${await calendarModule.formatWorkingHours()}`);
         log.action('owner-command', `Days off set: ${offDays.join(',')}`);
         break;
       }
@@ -1067,7 +1067,7 @@ Return ONLY JSON.`;
         reply('Tell me the role and the duration. Example: "lawyers get 60 minute appointments"');
         break;
       }
-      calendarModule.setDurationForRelationship(relationship, minutes);
+      await calendarModule.setDurationForRelationship(relationship, minutes);
       reply(`✅ ${relationship} appointments are now ${minutes} minutes by default.`);
       log.action('owner-command', `Duration set for ${relationship}: ${minutes}min`);
       break;

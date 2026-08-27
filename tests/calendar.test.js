@@ -4,6 +4,7 @@
 // paths from the real config.json — same limitation contacts.js/queue.js
 // already have with no dedicated test file.
 
+import { jest } from '@jest/globals';
 import * as calendar from '../calendar.js';
 
 describe('parseWorkingHoursPhrase', () => {
@@ -169,5 +170,192 @@ describe('parseDatetimePhrase', () => {
 
   it('returns null for null input', () => {
     expect(calendar.parseDatetimePhrase(null, anchor)).toBeNull();
+  });
+});
+
+describe('calendar (Core write-through)', () => {
+  let fetchSpy;
+
+  beforeEach(() => {
+    fetchSpy = jest.spyOn(global, 'fetch');
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  function mockResponse(status, body) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body
+    };
+  }
+
+  describe('mapCoreToJS & mapJSToCore', () => {
+    it('correctly maps between Core Appointment and JS object', () => {
+      const core = {
+        id: 42,
+        external_id: 'appt_12345',
+        uid: 'appt_12345@aigentik.local',
+        ics_sequence: 1,
+        title: 'Roof Inspection',
+        start_time: '2026-08-30T10:00:00.000Z',
+        end_time: '2026-08-30T10:30:00.000Z',
+        contact_external_id: 'contact_001',
+        customer_id: 10,
+        attendee_name: 'Bob',
+        attendee_email: 'bob@example.com',
+        appointment_type: 'in_person',
+        status: 'confirmed',
+        rsvp_status: 'accepted',
+        pending_reschedule: null,
+        form_sent: 1,
+        offered_slots: [],
+        requested_datetime: '2026-08-30T10:00:00.000Z',
+        created_via: 'owner',
+        notes: 'Check south slope',
+        created_at: '2026-08-27T00:00:00.000Z',
+        updated_at: '2026-08-27T01:00:00.000Z',
+        history: [{ event: 'created', at: '2026-08-27T00:00:00.000Z' }]
+      };
+
+      const js = calendar.mapCoreToJS(core);
+      expect(js.id).toBe('appt_12345');
+      expect(js._core_id).toBe(42);
+      expect(js.contact_id).toBe('contact_001');
+      expect(js.form_sent).toBe(true);
+      expect(js.start).toBe('2026-08-30T10:00:00.000Z');
+
+      const backToCore = calendar.mapJSToCore(js);
+      expect(backToCore.external_id).toBe('appt_12345');
+      expect(backToCore.contact_external_id).toBe('contact_001');
+      expect(backToCore.form_sent).toBe(1);
+      expect(backToCore.start_time).toBe('2026-08-30T10:00:00.000Z');
+    });
+  });
+
+  describe('loadCalendar & loadScheduleConfig', () => {
+    it('fetches appointments from Core API', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        appointments: [
+          { id: 1, external_id: 'appt_1', title: 'Inspection', status: 'confirmed', start_time: '2026-08-30T10:00:00Z', end_time: '2026-08-30T10:30:00Z' }
+        ]
+      }));
+
+      const appts = await calendar.loadCalendar();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/appointments');
+      expect(appts).toHaveLength(1);
+      expect(appts[0].id).toBe('appt_1');
+      expect(appts[0]._core_id).toBe(1);
+    });
+
+    it('fetches schedule config from Core API or falls back to defaults on 404', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(404, { error: 'Not found' }));
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.default_duration_minutes).toBe(30);
+      expect(cfg.booking_window_days).toBe(365);
+    });
+  });
+
+  describe('createAppointment & proposeAppointment', () => {
+    it('creates a confirmed appointment via POST /api/v1/appointments', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(201, {
+        appointment: {
+          id: 5,
+          external_id: 'appt_555',
+          title: 'Consultation',
+          status: 'confirmed',
+          start_time: '2026-08-30T14:00:00.000Z',
+          end_time: '2026-08-30T14:30:00.000Z',
+          attendee_name: 'Charlie'
+        }
+      }));
+
+      const created = await calendar.createAppointment({
+        title: 'Consultation',
+        start: '2026-08-30T14:00:00.000Z',
+        end: '2026-08-30T14:30:00.000Z',
+        attendeeName: 'Charlie'
+      });
+
+      expect(created.id).toBe('appt_555');
+      expect(created._core_id).toBe(5);
+      expect(created.status).toBe('confirmed');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/appointments');
+      expect(fetchSpy.mock.calls[0][1].method).toBe('POST');
+    });
+
+    it('proposes a negotiating appointment via POST /api/v1/appointments', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(201, {
+        appointment: {
+          id: 6,
+          external_id: 'appt_666',
+          title: 'Negotiation',
+          status: 'negotiating',
+          offered_slots: [{ start: '2026-08-30T10:00:00.000Z', end: '2026-08-30T10:30:00.000Z' }]
+        }
+      }));
+
+      const proposed = await calendar.proposeAppointment({
+        title: 'Negotiation',
+        offeredSlots: [{ start: new Date('2026-08-30T10:00:00.000Z'), end: new Date('2026-08-30T10:30:00.000Z') }]
+      });
+
+      expect(proposed.id).toBe('appt_666');
+      expect(proposed.status).toBe('negotiating');
+      expect(proposed.offered_slots).toHaveLength(1);
+    });
+  });
+
+  describe('updateAppointment / reschedule / cancel', () => {
+    it('reschedules an appointment and increments ics_sequence', async () => {
+      // 1st call for loadCalendar, 2nd call for update
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 10, external_id: 'appt_10', title: 'Inspection', status: 'confirmed', ics_sequence: 1, start_time: '2026-08-30T10:00:00.000Z', end_time: '2026-08-30T10:30:00.000Z' }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 10, external_id: 'appt_10', title: 'Inspection', status: 'confirmed', ics_sequence: 1, start_time: '2026-08-30T10:00:00.000Z', end_time: '2026-08-30T10:30:00.000Z' }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointment: {
+            id: 10,
+            external_id: 'appt_10',
+            title: 'Inspection',
+            status: 'confirmed',
+            ics_sequence: 2,
+            start_time: '2026-08-31T11:00:00.000Z',
+            end_time: '2026-08-31T11:30:00.000Z'
+          }
+        }));
+
+      const updated = await calendar.rescheduleAppointment('appt_10', '2026-08-31T11:00:00.000Z', '2026-08-31T11:30:00.000Z');
+      expect(updated.ics_sequence).toBe(2);
+      expect(updated.start).toBe('2026-08-31T11:00:00.000Z');
+      expect(fetchSpy.mock.calls[2][0].pathname).toBe('/api/v1/appointments/10/update');
+    });
+
+    it('cancels an appointment', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 12, external_id: 'appt_12', title: 'Meeting', status: 'confirmed' }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointment: { id: 12, external_id: 'appt_12', title: 'Meeting', status: 'cancelled' }
+        }));
+
+      const cancelled = await calendar.cancelAppointment('appt_12');
+      expect(cancelled.status).toBe('cancelled');
+      expect(fetchSpy.mock.calls[1][0].pathname).toBe('/api/v1/appointments/12/update');
+    });
   });
 });

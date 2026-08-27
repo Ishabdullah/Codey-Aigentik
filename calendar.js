@@ -1,16 +1,21 @@
 // calendar.js — Aigentik self-hosted appointment calendar
 // No external calendar API/OAuth — Aigentik is the source of truth for
 // appointments, pushed to real calendars via .ics invite emails
-// (see email-provider.js). Same load/save-flat-file pattern as contacts.js.
+// (see email-provider.js).
+//
+// B2 task 4 write-through (2026-08-27): this module used to store
+// appointments in data/calendar.json and schedule config in data/schedule-config.json.
+// It now writes through to Restoricon Core's /api/v1/appointments* and
+// /api/v1/schedule-config routes instead — Core is the single source of truth,
+// Core-only, with no local-JSON fallback.
 
-import fs from 'fs';
-import path from 'path';
 import * as chrono from 'chrono-node';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 
-const CALENDAR_FILE = path.join(config.paths.data_dir, 'calendar.json');
-const SCHEDULE_CONFIG_FILE = path.join(config.paths.data_dir, 'schedule-config.json');
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+const LIST_LIMIT = 1000;
 
 // Fully open by default (all 7 days, 00:00-23:59) — Aigentik doesn't know your
 // real availability until you tell it, so it shouldn't invent a 9-5 Mon-Fri
@@ -29,105 +34,188 @@ const DEFAULT_SCHEDULE_CONFIG = {
 
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
-// ─── Storage ────────────────────────────────────────────────────────────────
+// ─── HTTP Core API Helpers ──────────────────────────────────────────────────
 
-function loadCalendar() {
-  try {
-    if (fs.existsSync(CALENDAR_FILE)) {
-      return JSON.parse(fs.readFileSync(CALENDAR_FILE, 'utf8'));
-    }
-  } catch (e) {
-    log.warn('calendar', 'Could not load calendar file', { error: e.message });
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('calendar: config.core_api.base_url/token not configured');
   }
-  return [];
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('calendar', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
 }
 
-function saveCalendar(appointments) {
-  try {
-    fs.writeFileSync(CALENDAR_FILE, JSON.stringify(appointments, null, 2));
-  } catch (e) {
-    log.error('calendar', 'Failed to save calendar', { error: e.message });
-  }
+function mapCoreToJS(core) {
+  if (!core) return null;
+  return {
+    id: core.external_id || (core.id ? `appt_${String(core.id).padStart(4, '0')}` : null),
+    _core_id: core.id,
+    uid: core.uid || (core.external_id ? `${core.external_id}@aigentik.local` : null),
+    ics_sequence: core.ics_sequence || 0,
+    title: core.title || '',
+    start: core.start_time || null,
+    end: core.end_time || null,
+    contact_id: core.contact_external_id || (core.customer_id ? String(core.customer_id) : null),
+    attendee_name: core.attendee_name || null,
+    attendee_email: core.attendee_email || null,
+    appointment_type: core.appointment_type || null,
+    status: core.status || 'confirmed',
+    rsvp_status: core.rsvp_status || 'pending',
+    pending_reschedule: core.pending_reschedule || null,
+    form_sent: Boolean(core.form_sent),
+    offered_slots: core.offered_slots || [],
+    requested_datetime: core.requested_datetime || null,
+    created_via: core.created_via || 'owner',
+    notes: core.notes || null,
+    created_at: core.created_at || null,
+    updated_at: core.updated_at || null,
+    history: core.history || []
+  };
 }
 
-function loadScheduleConfig() {
+function mapJSToCore(js) {
+  if (!js) return null;
+  const core = {
+    external_id: js.id || null,
+    uid: js.uid || null,
+    ics_sequence: js.ics_sequence || 0,
+    title: js.title || '',
+    start_time: js.start ? new Date(js.start).toISOString() : null,
+    end_time: js.end ? new Date(js.end).toISOString() : null,
+    contact_external_id: js.contact_id ? String(js.contact_id) : null,
+    attendee_name: js.attendee_name || null,
+    attendee_email: js.attendee_email || null,
+    appointment_type: js.appointment_type || null,
+    status: js.status || 'confirmed',
+    rsvp_status: js.rsvp_status || 'pending',
+    pending_reschedule: js.pending_reschedule || null,
+    form_sent: js.form_sent ? 1 : 0,
+    offered_slots: js.offered_slots || [],
+    requested_datetime: js.requested_datetime || null,
+    created_via: js.created_via || 'owner',
+    notes: js.notes || null,
+    history: js.history || []
+  };
+  if (js.customer_id) core.customer_id = js.customer_id;
+  return core;
+}
+
+// ─── Storage (Core API) ─────────────────────────────────────────────────────
+
+async function loadCalendar() {
+  const { ok, status, data, parseError } = await coreRequest('GET', '/api/v1/appointments', {
+    query: { limit: LIST_LIMIT }
+  });
+  if (!ok) throw new Error(`Core appointments list failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  return (data.appointments || []).map(mapCoreToJS);
+}
+
+async function loadScheduleConfig() {
   try {
-    if (fs.existsSync(SCHEDULE_CONFIG_FILE)) {
-      return { ...DEFAULT_SCHEDULE_CONFIG, ...JSON.parse(fs.readFileSync(SCHEDULE_CONFIG_FILE, 'utf8')) };
+    const { ok, status, data } = await coreRequest('GET', '/api/v1/schedule-config');
+    if (ok && data?.schedule_config) {
+      return { ...DEFAULT_SCHEDULE_CONFIG, ...data.schedule_config };
+    }
+    if (status === 404) {
+      return { ...DEFAULT_SCHEDULE_CONFIG };
     }
   } catch (e) {
-    log.warn('calendar', 'Could not load schedule config, using defaults', { error: e.message });
+    log.warn('calendar', 'Could not load schedule config from Core, using defaults', { error: e.message });
   }
   return { ...DEFAULT_SCHEDULE_CONFIG };
 }
 
-function saveScheduleConfig(scheduleConfig) {
-  try {
-    fs.writeFileSync(SCHEDULE_CONFIG_FILE, JSON.stringify(scheduleConfig, null, 2));
-  } catch (e) {
-    log.error('calendar', 'Failed to save schedule config', { error: e.message });
-  }
-}
-
-function generateAppointmentId(appointments) {
-  const maxId = appointments.reduce((max, a) => {
-    const num = parseInt((a.id || '').replace('appt_', ''), 10) || 0;
-    return num > max ? num : max;
-  }, 0);
-  return `appt_${String(maxId + 1).padStart(4, '0')}`;
+async function saveScheduleConfig(scheduleConfig) {
+  const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/schedule-config', {
+    body: {
+      working_hours: scheduleConfig.working_hours,
+      default_duration_minutes: scheduleConfig.default_duration_minutes,
+      buffer_minutes: scheduleConfig.buffer_minutes,
+      booking_window_days: scheduleConfig.booking_window_days,
+      duration_by_relationship: scheduleConfig.duration_by_relationship
+    }
+  });
+  if (!ok) throw new Error(`Core schedule-config save failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  return data.schedule_config;
 }
 
 // ─── Working hours / duration rules ────────────────────────────────────────
 
-function getDurationForRelationship(relationship) {
-  const scheduleConfig = loadScheduleConfig();
+async function getDurationForRelationship(relationship, scheduleConfig) {
+  const configObj = scheduleConfig || await loadScheduleConfig();
   if (relationship) {
     const rel = relationship.toLowerCase().trim();
-    if (scheduleConfig.duration_by_relationship?.[rel]) {
-      return scheduleConfig.duration_by_relationship[rel];
+    if (configObj.duration_by_relationship?.[rel]) {
+      return configObj.duration_by_relationship[rel];
     }
   }
-  return scheduleConfig.default_duration_minutes;
+  return configObj.default_duration_minutes;
 }
 
-function setWorkingHours(days, start, end) {
-  const scheduleConfig = loadScheduleConfig();
+async function setWorkingHours(days, start, end) {
+  const scheduleConfig = await loadScheduleConfig();
   days.forEach(day => {
     const key = day.toLowerCase().slice(0, 3);
     if (DAY_KEYS.includes(key)) {
       scheduleConfig.working_hours[key] = { start, end };
     }
   });
-  saveScheduleConfig(scheduleConfig);
+  await saveScheduleConfig(scheduleConfig);
   log.info('calendar', 'Working hours updated', { days, start, end });
   return scheduleConfig.working_hours;
 }
 
-function setDayOff(days) {
-  const scheduleConfig = loadScheduleConfig();
+async function setDayOff(days) {
+  const scheduleConfig = await loadScheduleConfig();
   days.forEach(day => {
     const key = day.toLowerCase().slice(0, 3);
     if (DAY_KEYS.includes(key)) {
       scheduleConfig.working_hours[key] = null;
     }
   });
-  saveScheduleConfig(scheduleConfig);
+  await saveScheduleConfig(scheduleConfig);
   return scheduleConfig.working_hours;
 }
 
-function setDurationForRelationship(relationship, minutes) {
-  const scheduleConfig = loadScheduleConfig();
+async function setDurationForRelationship(relationship, minutes) {
+  const scheduleConfig = await loadScheduleConfig();
   scheduleConfig.duration_by_relationship[relationship.toLowerCase().trim()] = minutes;
-  saveScheduleConfig(scheduleConfig);
+  await saveScheduleConfig(scheduleConfig);
   log.info('calendar', `Appointment duration set for ${relationship}: ${minutes}min`);
   return scheduleConfig;
 }
 
-function formatWorkingHours() {
-  const scheduleConfig = loadScheduleConfig();
+async function formatWorkingHours(scheduleConfig) {
+  const configObj = scheduleConfig || await loadScheduleConfig();
   const lines = DAY_KEYS.filter(k => k !== 'sun' || true).map(key => {
     const label = { sun: 'Sun', mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat' }[key];
-    const hours = scheduleConfig.working_hours[key];
+    const hours = configObj.working_hours?.[key];
     return `${label}: ${hours ? `${hours.start}-${hours.end}` : 'off'}`;
   });
   return lines.join(', ');
@@ -135,23 +223,12 @@ function formatWorkingHours() {
 
 // ─── Natural-language phrase parsing (deterministic, no LLM date math) ────
 
-// Turn a raw phrase like "next tuesday at 2pm" into a concrete Date, anchored
-// to now. Returns null if chrono can't find a date in it. forwardDate:true
-// so an ambiguous month/day that's already passed this year ("July 3rd" said
-// in August) resolves to next year, not a date in the past — appointments
-// are never booked in the past, so rolling forward is always correct here.
 function parseDatetimePhrase(phrase, anchorDate) {
   if (!phrase) return null;
   const result = chrono.parseDate(phrase, anchorDate ? new Date(anchorDate) : new Date(), { forwardDate: true });
   return result || null;
 }
 
-// Like parseDatetimePhrase, but also reports whether an explicit date (day/
-// weekday/month) was actually stated, vs. only a time with the date
-// defaulted by chrono from the anchor. Callers use this to tell "Tuesday at
-// 2pm" (explicit) apart from a bare "how about 11am instead" (not explicit —
-// should be anchored to whatever date is already under discussion, not to
-// "now"). Returns null if chrono finds nothing at all.
 function parseDatetimeDetailed(phrase, anchorDate) {
   if (!phrase) return null;
   const results = chrono.parse(phrase, anchorDate ? new Date(anchorDate) : new Date(), { forwardDate: true });
@@ -161,10 +238,6 @@ function parseDatetimeDetailed(phrase, anchorDate) {
   return { date: start.date(), hasExplicitDate };
 }
 
-// Combine a bare time-of-day (from a chrono result with no explicit date)
-// with a separate anchor date — used when someone replies with just a time
-// during an active negotiation, so "11am" means "11am on the date we were
-// just discussing," not "11am today."
 function combineTimeWithDate(timeOnlyDate, anchorDate) {
   const combined = new Date(anchorDate);
   combined.setHours(timeOnlyDate.getHours(), timeOnlyDate.getMinutes(), 0, 0);
@@ -178,9 +251,6 @@ const DAY_NAME_TO_KEY = {
 };
 const DAY_ORDER = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
-// Shared by parseWorkingHoursPhrase and parseDayOffPhrase: pull day names
-// out of a lowercased phrase, expanding "weekday(s)"/"weekend(s)" and
-// "X through/to Y" ranges, falling back to a plain substring scan.
 function extractDaysFromPhrase(lower) {
   if (/weekday/.test(lower)) return ['mon', 'tue', 'wed', 'thu', 'fri'];
   if (/weekend/.test(lower)) return ['sat', 'sun'];
@@ -205,10 +275,6 @@ function extractDaysFromPhrase(lower) {
   return [...new Set(days)];
 }
 
-// Turn a phrase like "9am to 5pm monday through friday" into
-// { days: ['mon','tue',...], start: 'HH:MM', end: 'HH:MM' }, or null if it
-// can't be parsed. Handled deterministically (not by the LLM) since it's a
-// well-bounded extraction task and the failure mode of a wrong config is bad.
 function parseWorkingHoursPhrase(phrase) {
   if (!phrase) return null;
   const lower = phrase.toLowerCase();
@@ -225,8 +291,6 @@ function parseWorkingHoursPhrase(phrase) {
     return `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
   };
 
-  // If only one side specifies am/pm, assume the same for the other unless
-  // the times suggest otherwise (e.g. "9 to 5" -> 9am to 5pm, business hours)
   const [, sh, sm, sMer, eh, em, eMer] = timeRangeMatch;
   const startMeridiem = sMer || (parseInt(sh, 10) < 12 ? 'am' : 'pm');
   const endMeridiem = eMer || sMer || 'pm';
@@ -239,11 +303,6 @@ function parseWorkingHoursPhrase(phrase) {
   return { days, start, end };
 }
 
-// Turn a phrase like "I don't work on Sundays" / "closed on weekends" /
-// "no appointments on Saturday" into a list of day keys to mark off, or
-// null if no such phrase is recognized. Only tried after
-// parseWorkingHoursPhrase fails to find a time range, so it's specifically
-// for "day off" statements, not hours statements.
 const DAY_OFF_KEYWORDS = /\b(don'?t work|do not work|not working|off|closed|no appointments|no work|unavailable|not available)\b/i;
 function parseDayOffPhrase(phrase) {
   if (!phrase) return null;
@@ -254,14 +313,10 @@ function parseDayOffPhrase(phrase) {
   return days.length > 0 ? days : null;
 }
 
-// Does a raw scheduling phrase explicitly ask for today? Used to gate
-// same-day booking — Aigentik should never book today on its own initiative,
-// only when the person actually said "today"/"tonight".
 function mentionsToday(phrase) {
   return /\btoday\b|\btonight\b/i.test(phrase || '');
 }
 
-// Start of the next calendar day after `from` (or now)
 function startOfTomorrow(from) {
   const d = from ? new Date(from) : new Date();
   d.setDate(d.getDate() + 1);
@@ -271,7 +326,6 @@ function startOfTomorrow(from) {
 
 // ─── Slot finding ───────────────────────────────────────────────────────────
 
-// Check whether [start, end) fits inside that day's working hours
 function fitsWorkingHours(start, end, dayHours) {
   if (!dayHours) return false;
   const dayStart = new Date(start);
@@ -283,57 +337,47 @@ function fitsWorkingHours(start, end, dayHours) {
   return start >= dayStart && end <= dayEnd;
 }
 
-// Check whether [start, end) conflicts with any existing confirmed appointment,
-// honoring the buffer on both sides
 function hasConflict(start, end, appointments, bufferMinutes, excludeId) {
   const bufferMs = bufferMinutes * 60 * 1000;
   return appointments.some(a => {
     if (a.status !== 'confirmed') return false;
-    if (excludeId && a.id === excludeId) return false;
+    if (excludeId && (a.id === excludeId || a._core_id === excludeId)) return false;
     const aStart = new Date(a.start).getTime() - bufferMs;
     const aEnd = new Date(a.end).getTime() + bufferMs;
     return start.getTime() < aEnd && end.getTime() > aStart;
   });
 }
 
-// Is [start, end) a valid, open slot right now?
 function isSlotAvailable(start, end, scheduleConfig, appointments, excludeId) {
   const dayKey = DAY_KEYS[start.getDay()];
-  const dayHours = scheduleConfig.working_hours[dayKey];
+  const dayHours = scheduleConfig.working_hours?.[dayKey];
   if (!fitsWorkingHours(start, end, dayHours)) return false;
   if (hasConflict(start, end, appointments, scheduleConfig.buffer_minutes, excludeId)) return false;
   return true;
 }
 
-// Find the next available slot, honoring working hours + existing bookings.
-// If preferredDate is given and free, it's used as-is; otherwise this walks
-// forward from afterDate (or preferredDate, if later) day by day, checking
-// every slot_duration-aligned start time within working hours, up to
-// booking_window_days out.
-function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate, excludeId } = {}) {
-  const scheduleConfig = loadScheduleConfig();
-  const appointments = loadCalendar();
-  const duration = durationMinutes || scheduleConfig.default_duration_minutes;
+async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate, excludeId, scheduleConfig, appointments } = {}) {
+  const cfg = scheduleConfig || await loadScheduleConfig();
+  const appts = appointments || await loadCalendar();
+  const duration = durationMinutes || cfg.default_duration_minutes;
   const now = afterDate ? new Date(afterDate) : new Date();
 
   if (preferredDate) {
     const start = new Date(preferredDate);
     const end = new Date(start.getTime() + duration * 60 * 1000);
-    if (start > now && isSlotAvailable(start, end, scheduleConfig, appointments, excludeId)) {
+    if (start > now && isSlotAvailable(start, end, cfg, appts, excludeId)) {
       return { start, end };
     }
   }
 
-  // Walk forward from the later of now/preferredDate, in 15-minute increments,
-  // within each day's working hours, until we find an open slot.
   const searchStart = preferredDate && new Date(preferredDate) > now ? new Date(preferredDate) : now;
-  const windowEnd = new Date(now.getTime() + scheduleConfig.booking_window_days * 24 * 60 * 60 * 1000);
+  const windowEnd = new Date(now.getTime() + cfg.booking_window_days * 24 * 60 * 60 * 1000);
 
-  for (let dayOffset = 0; dayOffset < scheduleConfig.booking_window_days; dayOffset++) {
+  for (let dayOffset = 0; dayOffset < cfg.booking_window_days; dayOffset++) {
     const day = new Date(searchStart);
     day.setDate(day.getDate() + dayOffset);
     const dayKey = DAY_KEYS[day.getDay()];
-    const dayHours = scheduleConfig.working_hours[dayKey];
+    const dayHours = cfg.working_hours?.[dayKey];
     if (!dayHours) continue;
 
     const [sh, sm] = dayHours.start.split(':').map(Number);
@@ -349,30 +393,28 @@ function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate, excl
     while (slotStart.getTime() + duration * 60 * 1000 <= dayEnd.getTime()) {
       const slotEnd = new Date(slotStart.getTime() + duration * 60 * 1000);
       if (slotStart > windowEnd) return null;
-      if (isSlotAvailable(slotStart, slotEnd, scheduleConfig, appointments, excludeId)) {
-        return { start: slotStart, end: slotEnd };
+      if (isSlotAvailable(slotStart, slotEnd, cfg, appts, excludeId)) {
+        return { start, end: slotEnd };
       }
       slotStart = new Date(slotStart.getTime() + 15 * 60 * 1000);
     }
   }
 
-  return null; // fully booked for the entire window — extremely unlikely
+  return null;
 }
 
-// Generate up to `count` non-overlapping open slots — used to offer a
-// customer a few options rather than picking one for them. Each subsequent
-// search starts right after the previous offer ends, so they never collide
-// with each other even though none of them are booked yet.
-function generateOfferSlots({ durationMinutes, preferredDate, afterDate, count = 3 } = {}) {
+async function generateOfferSlots({ durationMinutes, preferredDate, afterDate, count = 3 } = {}) {
+  const scheduleConfig = await loadScheduleConfig();
+  const appointments = await loadCalendar();
   const offers = [];
   let cursor = afterDate;
   let firstPreferred = preferredDate;
   for (let i = 0; i < count; i++) {
-    const slot = findNextAvailableSlot({ afterDate: cursor, durationMinutes, preferredDate: firstPreferred });
+    const slot = await findNextAvailableSlot({ afterDate: cursor, durationMinutes, preferredDate: firstPreferred, scheduleConfig, appointments });
     if (!slot) break;
     offers.push(slot);
     cursor = new Date(slot.end.getTime() + 15 * 60 * 1000);
-    firstPreferred = null; // only honor the original preference for the first offer
+    firstPreferred = null;
   }
   return offers;
 }
@@ -381,11 +423,6 @@ function formatOfferList(offers) {
   return offers.map((s, i) => `${i + 1}. ${new Date(s.start).toLocaleString()}`).join('\n');
 }
 
-// "Do you have anything later?" / "anything earlier" against a set of
-// already-offered slots — neither is a parseable date/time on its own
-// (chrono-node has nothing to anchor "later" to), so this has to be
-// recognized as its own case rather than falling through to "I didn't
-// catch a specific time in that."
 function detectRelativeTimeRequest(text) {
   const lower = (text || '').toLowerCase();
   if (/\b(later|push (it )?back|something after|anything after)\b/.test(lower)) return 'later';
@@ -393,18 +430,13 @@ function detectRelativeTimeRequest(text) {
   return null;
 }
 
-// Bounded, same-day-only backward search for "anything earlier" — an
-// evening slot from the day before isn't a useful answer to "do you have
-// anything earlier [than what you just offered]", so this deliberately
-// doesn't cross into previous days. Returns up to `count` open slots
-// before `beforeDate` on its own calendar day, closest-to-beforeDate last.
-function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3, excludeId } = {}) {
-  const scheduleConfig = loadScheduleConfig();
-  const appointments = loadCalendar();
+async function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3, excludeId } = {}) {
+  const scheduleConfig = await loadScheduleConfig();
+  const appointments = await loadCalendar();
   const duration = durationMinutes || scheduleConfig.default_duration_minutes;
   const before = new Date(beforeDate);
   const dayKey = DAY_KEYS[before.getDay()];
-  const dayHours = scheduleConfig.working_hours[dayKey];
+  const dayHours = scheduleConfig.working_hours?.[dayKey];
   if (!dayHours) return [];
 
   const [sh, sm] = dayHours.start.split(':').map(Number);
@@ -425,12 +457,6 @@ function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3, exclu
 
 const ORDINAL_WORDS = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth'];
 
-// formatOfferList numbers its options 1/2/3 — a reply of bare "3", "option
-// 2", "the first one", etc. is exactly how a person actually answers a
-// numbered list, and none of that is a parseable date/time on its own
-// (chrono-node has no idea "3" means "the third option above"). Returns a
-// 0-based index into `offers`, or null if the text doesn't read as picking
-// one by position.
 function matchOfferedSlotSelection(text, offerCount) {
   const lower = (text || '').toLowerCase().trim();
 
@@ -455,15 +481,14 @@ function matchOfferedSlotSelection(text, offerCount) {
   return null;
 }
 
-// ─── Appointments ───────────────────────────────────────────────────────────
+// ─── Appointments (CRUD / Mutations via Core API) ───────────────────────────
 
-function createAppointment({ title, start, end, contactId, attendeeName, attendeeEmail, createdVia, notes, appointmentType }) {
-  const appointments = loadCalendar();
-  const id = generateAppointmentId(appointments);
-
-  const appointment = {
-    id,
-    uid: `${id}@aigentik.local`,
+async function createAppointment({ title, start, end, contactId, attendeeName, attendeeEmail, createdVia, notes, appointmentType }) {
+  const externalId = `appt_${Date.now()}`;
+  const now = new Date().toISOString();
+  const jsAppt = {
+    id: externalId,
+    uid: `${externalId}@aigentik.local`,
     ics_sequence: 0,
     title: title || `Appointment with ${attendeeName || attendeeEmail || 'contact'}`,
     start: new Date(start).toISOString(),
@@ -471,37 +496,35 @@ function createAppointment({ title, start, end, contactId, attendeeName, attende
     contact_id: contactId || null,
     attendee_name: attendeeName || null,
     attendee_email: attendeeEmail || null,
-    appointment_type: appointmentType || null, // 'call' | 'in_person' | null
+    appointment_type: appointmentType || null,
     status: 'confirmed',
-    rsvp_status: 'pending', // updated when the attendee accepts/declines via their calendar app
-    pending_reschedule: null, // set when a reschedule request is awaiting the other party's confirmation
+    rsvp_status: 'pending',
+    pending_reschedule: null,
     created_via: createdVia || 'owner',
     notes: notes || null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    history: [{ event: 'created', at: new Date().toISOString() }]
+    created_at: now,
+    updated_at: now,
+    history: [{ event: 'created', at: now }]
   };
 
-  appointments.push(appointment);
-  saveCalendar(appointments);
-  log.action('calendar', `Appointment created: ${appointment.title}`, { id, start: appointment.start });
-  return appointment;
+  const coreBody = mapJSToCore(jsAppt);
+  const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/appointments', {
+    body: coreBody
+  });
+  if (!ok) throw new Error(`Core appointment creation failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+
+  const created = mapCoreToJS(data.appointment);
+  log.action('calendar', `Appointment created: ${created.title}`, { id: created.id, start: created.start });
+  return created;
 }
 
-// ─── Negotiation (offer/counter-offer before a booking is confirmed) ──────
-// Used for inbound requests from customers/contacts: Aigentik never books
-// unilaterally when the exact requested/offered time isn't free — it
-// proposes and waits for the other party to agree, rather than silently
-// substituting a different time.
-
-function proposeAppointment({ title, contactId, attendeeName, attendeeEmail, createdVia, offeredSlots = [], appointmentType = null }) {
-  const appointments = loadCalendar();
-  const id = generateAppointmentId(appointments);
+async function proposeAppointment({ title, contactId, attendeeName, attendeeEmail, createdVia, offeredSlots = [], appointmentType = null }) {
+  const externalId = `appt_${Date.now()}`;
   const primary = offeredSlots[0] || null;
-
-  const appointment = {
-    id,
-    uid: `${id}@aigentik.local`,
+  const now = new Date().toISOString();
+  const jsAppt = {
+    id: externalId,
+    uid: `${externalId}@aigentik.local`,
     ics_sequence: 0,
     title: title || `Appointment with ${attendeeName || attendeeEmail || 'contact'}`,
     start: primary ? new Date(primary.start).toISOString() : null,
@@ -511,89 +534,77 @@ function proposeAppointment({ title, contactId, attendeeName, attendeeEmail, cre
     attendee_email: attendeeEmail || null,
     appointment_type: appointmentType,
     status: 'negotiating',
-    form_sent: false, // whether the intake template has already been sent to this contact
+    form_sent: false,
     rsvp_status: 'pending',
     pending_reschedule: null,
     offered_slots: offeredSlots.map(s => ({ start: new Date(s.start).toISOString(), end: new Date(s.end).toISOString() })),
-    // A time stated before every required field was collected (e.g. "I'm
-    // free Friday at noon" in the same message that's still missing an
-    // email) — set via setRequestedDatetime and honored once the intake is
-    // actually complete, instead of being silently forgotten in favor of
-    // generic offered slots. See processIntakeReply in index.js.
     requested_datetime: null,
     created_via: createdVia || 'owner',
     notes: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-    history: [{ event: 'proposed', at: new Date().toISOString() }]
+    created_at: now,
+    updated_at: now,
+    history: [{ event: 'proposed', at: now }]
   };
 
-  appointments.push(appointment);
-  saveCalendar(appointments);
-  log.action('calendar', `Appointment proposed: ${appointment.title}`, { id });
-  return appointment;
+  const coreBody = mapJSToCore(jsAppt);
+  const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/appointments', {
+    body: coreBody
+  });
+  if (!ok) throw new Error(`Core appointment proposal failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+
+  const proposed = mapCoreToJS(data.appointment);
+  log.action('calendar', `Appointment proposed: ${proposed.title}`, { id: proposed.id });
+  return proposed;
 }
 
-function setAppointmentType(id, type) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
+async function updateAppointment(id, updates) {
+  const appts = await loadCalendar();
+  const existing = appts.find(a => a.id === id || a._core_id === id);
+  if (!existing) return null;
 
-  appointments[idx].appointment_type = type;
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'type_set', at: appointments[idx].updated_at, type });
+  const coreId = existing._core_id;
+  const coreUpdates = {};
+  if (updates.title !== undefined) coreUpdates.title = updates.title;
+  if (updates.start !== undefined) coreUpdates.start_time = updates.start ? new Date(updates.start).toISOString() : null;
+  if (updates.end !== undefined) coreUpdates.end_time = updates.end ? new Date(updates.end).toISOString() : null;
+  if (updates.appointment_type !== undefined) coreUpdates.appointment_type = updates.appointment_type;
+  if (updates.status !== undefined) coreUpdates.status = updates.status;
+  if (updates.rsvp_status !== undefined) coreUpdates.rsvp_status = updates.rsvp_status;
+  if (updates.notes !== undefined) coreUpdates.notes = updates.notes;
+  if (updates.form_sent !== undefined) coreUpdates.form_sent = updates.form_sent ? 1 : 0;
+  if (updates.requested_datetime !== undefined) coreUpdates.requested_datetime = updates.requested_datetime;
+  if (updates.offered_slots !== undefined) coreUpdates.offered_slots = updates.offered_slots;
+  if (updates.pending_reschedule !== undefined) coreUpdates.pending_reschedule = updates.pending_reschedule;
+  if (updates.ics_sequence !== undefined) coreUpdates.ics_sequence = updates.ics_sequence;
+  if (updates.attendee_email !== undefined) coreUpdates.attendee_email = updates.attendee_email;
+  if (updates.history !== undefined) coreUpdates.history = updates.history;
 
-  saveCalendar(appointments);
-  return appointments[idx];
+  const { ok, status, data, parseError } = await coreRequest('POST', `/api/v1/appointments/${coreId}/update`, {
+    body: coreUpdates
+  });
+  if (!ok) throw new Error(`Core appointment update failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  return mapCoreToJS(data.appointment);
 }
 
-function markFormSent(id) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].form_sent = true;
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'form_sent', at: appointments[idx].updated_at });
-
-  saveCalendar(appointments);
-  return appointments[idx];
+async function setAppointmentType(id, type) {
+  return updateAppointment(id, { appointment_type: type });
 }
 
-function setAppointmentNotes(id, notes) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].notes = notes;
-  appointments[idx].updated_at = new Date().toISOString();
-
-  saveCalendar(appointments);
-  return appointments[idx];
+async function markFormSent(id) {
+  return updateAppointment(id, { form_sent: true });
 }
 
-function setRequestedDatetime(id, isoString) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].requested_datetime = isoString;
-  appointments[idx].updated_at = new Date().toISOString();
-
-  saveCalendar(appointments);
-  return appointments[idx];
+async function setAppointmentNotes(id, notes) {
+  return updateAppointment(id, { notes });
 }
 
-// Deterministic (not LLM) — keyword-based, since this only needs to
-// distinguish two categories and a wrong guess here would misroute the
-// whole intake flow.
+async function setRequestedDatetime(id, isoString) {
+  return updateAppointment(id, { requested_datetime: isoString });
+}
+
 function detectAppointmentTypeFromText(text) {
   const lower = (text || '').toLowerCase();
   const matchesCall = /\b(call|phone call|video call|zoom|virtual|over the phone|on the phone|call me|give (me|us) a call|just (talk|discuss) (over|on) the phone)\b/.test(lower);
-  // A negated visit ("no need for anyone to come out, we can just talk on
-  // the phone") would otherwise match the in-person pattern below on
-  // "come out" alone — a plain regex has no concept of negation, so check
-  // for it explicitly and let an explicit call mention win.
   const negatesVisit = /\b(no need|don'?t need|not necessary|no reason)\b[^.!?]{0,40}\b(come|visit|stop by|in[\s-]?person)\b/.test(lower);
   if (negatesVisit && matchesCall) return 'call';
   if (/\b(in[\s-]?person|come (over|by|out|check|take a look|look at)|someone (come|stop by|here|out)|(send|need) someone (here|out)|someone (to )?(come|look|take|check)|stop by|at (my|your|the) (home|house|office|place)|visit|on[\s-]?site|drop by)\b/.test(lower)) return 'in_person';
@@ -601,167 +612,114 @@ function detectAppointmentTypeFromText(text) {
   return null;
 }
 
-function updateNegotiationOffers(id, offeredSlots) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
+async function updateNegotiationOffers(id, offeredSlots) {
   const iso = offeredSlots.map(s => ({ start: new Date(s.start).toISOString(), end: new Date(s.end).toISOString() }));
-  appointments[idx].offered_slots = iso;
-  appointments[idx].start = iso[0].start;
-  appointments[idx].end = iso[0].end;
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'counter_offered', at: appointments[idx].updated_at });
-
-  saveCalendar(appointments);
-  return appointments[idx];
+  return updateAppointment(id, { offered_slots: iso, start: iso[0]?.start, end: iso[0]?.end });
 }
 
-function confirmNegotiation(id, start, end, attendeeEmail) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].status = 'confirmed';
-  appointments[idx].start = new Date(start).toISOString();
-  appointments[idx].end = new Date(end).toISOString();
-  appointments[idx].offered_slots = [];
-  if (attendeeEmail) appointments[idx].attendee_email = attendeeEmail;
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'confirmed', at: appointments[idx].updated_at });
-
-  saveCalendar(appointments);
-  log.action('calendar', `Negotiation confirmed as appointment: ${appointments[idx].title}`, { id });
-  return appointments[idx];
-}
-
-function findNegotiationsByContact(contactId) {
-  if (!contactId) return [];
-  return loadCalendar().filter(a => a.contact_id === contactId && a.status === 'negotiating');
-}
-
-// Reschedule negotiation: a lighter-weight version for an already-confirmed
-// appointment. The old time stays booked (still shows as busy) until the
-// other party confirms the new one, rather than moving it unilaterally.
-function setPendingReschedule(id, slot) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].pending_reschedule = { start: new Date(slot.start).toISOString(), end: new Date(slot.end).toISOString() };
-  appointments[idx].updated_at = new Date().toISOString();
-  saveCalendar(appointments);
-  return appointments[idx];
-}
-
-function clearPendingReschedule(id) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].pending_reschedule = null;
-  saveCalendar(appointments);
-  return appointments[idx];
-}
-
-function rescheduleAppointment(id, newStart, newEnd) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  const appt = appointments[idx];
-  const fromStart = appt.start;
-  appt.start = new Date(newStart).toISOString();
-  appt.end = new Date(newEnd).toISOString();
-  appt.status = 'confirmed';
-  appt.rsvp_status = 'pending';
-  appt.pending_reschedule = null;
-  appt.ics_sequence = (appt.ics_sequence || 0) + 1;
-  appt.updated_at = new Date().toISOString();
-  appt.history.push({ event: 'rescheduled', at: appt.updated_at, from: fromStart, to: appt.start });
-
-  appointments[idx] = appt;
-  saveCalendar(appointments);
-  log.action('calendar', `Appointment rescheduled: ${appt.title}`, { id, from: fromStart, to: appt.start });
+async function confirmNegotiation(id, start, end, attendeeEmail) {
+  const updates = {
+    status: 'confirmed',
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+    offered_slots: []
+  };
+  if (attendeeEmail) updates.attendee_email = attendeeEmail;
+  const appt = await updateAppointment(id, updates);
+  if (appt) log.action('calendar', `Negotiation confirmed as appointment: ${appt.title}`, { id });
   return appt;
 }
 
-function cancelAppointment(id) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-
-  appointments[idx].status = 'cancelled';
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'cancelled', at: appointments[idx].updated_at });
-
-  saveCalendar(appointments);
-  log.action('calendar', `Appointment cancelled: ${appointments[idx].title}`, { id });
-  return appointments[idx];
-}
-
-function getAppointment(id) {
-  return loadCalendar().find(a => a.id === id) || null;
-}
-
-function findAppointmentsByContact(contactId) {
+async function findNegotiationsByContact(contactId) {
   if (!contactId) return [];
-  return loadCalendar().filter(a => a.contact_id === contactId && a.status === 'confirmed');
+  const appts = await loadCalendar();
+  return appts.filter(a => a.contact_id === String(contactId) && a.status === 'negotiating');
 }
 
-// The soonest confirmed appointment for this contact that hasn't happened
-// yet — used to (a) stop a fresh estimate/price question from proposing a
-// duplicate booking when one's already confirmed, and (b) let reply
-// generation mention it naturally instead of acting like it doesn't exist.
-function findUpcomingAppointmentForContact(contactId) {
+async function setPendingReschedule(id, slot) {
+  return updateAppointment(id, {
+    pending_reschedule: { start: new Date(slot.start).toISOString(), end: new Date(slot.end).toISOString() }
+  });
+}
+
+async function clearPendingReschedule(id) {
+  return updateAppointment(id, { pending_reschedule: null });
+}
+
+async function rescheduleAppointment(id, newStart, newEnd) {
+  const appt = await getAppointment(id);
+  if (!appt) return null;
+  const fromStart = appt.start;
+  const updated = await updateAppointment(id, {
+    start: new Date(newStart).toISOString(),
+    end: new Date(newEnd).toISOString(),
+    status: 'confirmed',
+    rsvp_status: 'pending',
+    pending_reschedule: null,
+    ics_sequence: (appt.ics_sequence || 0) + 1
+  });
+  if (updated) log.action('calendar', `Appointment rescheduled: ${updated.title}`, { id, from: fromStart, to: updated.start });
+  return updated;
+}
+
+async function cancelAppointment(id) {
+  const updated = await updateAppointment(id, { status: 'cancelled' });
+  if (updated) log.action('calendar', `Appointment cancelled: ${updated.title}`, { id });
+  return updated;
+}
+
+async function getAppointment(id) {
+  const appts = await loadCalendar();
+  return appts.find(a => a.id === id || a._core_id === id) || null;
+}
+
+async function findAppointmentsByContact(contactId) {
+  if (!contactId) return [];
+  const appts = await loadCalendar();
+  return appts.filter(a => a.contact_id === String(contactId) && a.status === 'confirmed');
+}
+
+async function findUpcomingAppointmentForContact(contactId) {
   if (!contactId) return null;
+  const appts = await findAppointmentsByContact(contactId);
   const now = new Date();
-  return findAppointmentsByContact(contactId)
-    .filter(a => new Date(a.start) >= now)
-    .sort((a, b) => new Date(a.start) - new Date(b.start))[0] || null;
+  return appts.filter(a => new Date(a.start) >= now).sort((a, b) => new Date(a.start) - new Date(b.start))[0] || null;
 }
 
-// Most relevant appointment for a given attendee email — used to match an
-// incoming calendar-response email (accept/decline) back to the booking it's
-// about. Prefers the soonest upcoming one still awaiting a response.
-function findAppointmentByAttendeeEmail(email) {
+async function findAppointmentByAttendeeEmail(email) {
   if (!email) return null;
   const norm = email.toLowerCase().trim();
-  const matches = loadCalendar()
+  const appts = await loadCalendar();
+  const matches = appts
     .filter(a => a.status === 'confirmed' && a.attendee_email?.toLowerCase().trim() === norm)
     .sort((a, b) => new Date(a.start) - new Date(b.start));
   if (matches.length === 0) return null;
   return matches.find(a => a.rsvp_status === 'pending') || matches[0];
 }
 
-function setRsvpStatus(id, status) {
-  const appointments = loadCalendar();
-  const idx = appointments.findIndex(a => a.id === id);
-  if (idx === -1) return null;
-  appointments[idx].rsvp_status = status;
-  appointments[idx].updated_at = new Date().toISOString();
-  appointments[idx].history.push({ event: 'rsvp', at: appointments[idx].updated_at, status });
-  saveCalendar(appointments);
-  log.info('calendar', `RSVP recorded for ${appointments[idx].title}: ${status}`, { id });
-  return appointments[idx];
+async function setRsvpStatus(id, status) {
+  const updated = await updateAppointment(id, { rsvp_status: status });
+  if (updated) log.info('calendar', `RSVP recorded for ${updated.title}: ${status}`, { id });
+  return updated;
 }
 
-function findUpcoming(days = 30) {
+async function findUpcoming(days = 30) {
   const now = new Date();
   const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-  return loadCalendar()
+  const appts = await loadCalendar();
+  return appts
     .filter(a => a.status === 'confirmed' && new Date(a.start) >= now && new Date(a.start) <= until)
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 }
 
-// All confirmed appointments falling on the same calendar day as `date`
-function findForDate(date) {
+async function findForDate(date) {
   const target = new Date(date);
   const dayStart = new Date(target);
   dayStart.setHours(0, 0, 0, 0);
   const dayEnd = new Date(target);
   dayEnd.setHours(23, 59, 59, 999);
-  return loadCalendar()
+  const appts = await loadCalendar();
+  return appts
     .filter(a => a.status === 'confirmed' && new Date(a.start) >= dayStart && new Date(a.start) <= dayEnd)
     .sort((a, b) => new Date(a.start) - new Date(b.start));
 }
@@ -773,26 +731,29 @@ function formatAppointment(appt) {
   return `${appt.title} — ${start.toLocaleString()} (${appt.attendee_name || appt.attendee_email || 'no contact'})${typeLabel}`;
 }
 
-function listUpcomingForSms(days = 14) {
-  const upcoming = findUpcoming(days);
+async function listUpcomingForSms(days = 14) {
+  const upcoming = await findUpcoming(days);
   if (upcoming.length === 0) return `📅 No appointments in the next ${days} days.`;
   const lines = [`📅 Upcoming appointments:\n`];
-  upcoming.forEach(a => lines.push(`#${a.id.replace('appt_', '')} ${formatAppointment(a)}`));
+  upcoming.forEach(a => lines.push(`#${(a.id || '').replace('appt_', '')} ${formatAppointment(a)}`));
   return lines.join('\n');
 }
 
-function listForDateForSms(date) {
-  const appts = findForDate(date);
+async function listForDateForSms(date) {
+  const appts = await findForDate(date);
   const label = new Date(date).toLocaleDateString();
   if (appts.length === 0) return `📅 No appointments on ${label}.`;
   const lines = [`📅 Appointments on ${label}:\n`];
-  appts.forEach(a => lines.push(`#${a.id.replace('appt_', '')} ${formatAppointment(a)}`));
+  appts.forEach(a => lines.push(`#${(a.id || '').replace('appt_', '')} ${formatAppointment(a)}`));
   return lines.join('\n');
 }
 
 export {
+  mapCoreToJS,
+  mapJSToCore,
   loadCalendar,
   loadScheduleConfig,
+  saveScheduleConfig,
   parseDatetimePhrase,
   parseDatetimeDetailed,
   combineTimeWithDate,
@@ -814,6 +775,7 @@ export {
   detectAppointmentTypeFromText,
   createAppointment,
   proposeAppointment,
+  updateAppointment,
   setAppointmentType,
   markFormSent,
   setAppointmentNotes,

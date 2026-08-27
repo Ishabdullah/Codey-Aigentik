@@ -252,7 +252,7 @@ function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
 // every path (fresh intake, time negotiation, reschedule) sounds the same.
 async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, senderLabel, reply }) {
   const typeLabel = negotiation.appointment_type === 'in_person' ? 'in-person appointment' : 'phone call';
-  const appt = calendarModule.confirmNegotiation(negotiation.id, slot.start, slot.end, attendeeEmail);
+  const appt = await calendarModule.confirmNegotiation(negotiation.id, slot.start, slot.end, attendeeEmail);
   const details = customerDetailBlock(appt, senderLabel, attendeeEmail);
   if (attendeeEmail) await gmail.sendCalendarInvite(appt, attendeeEmail);
   await gmail.sendCalendarInvite(appt, adminEmail,
@@ -281,7 +281,7 @@ async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, s
 // asked for as a blanket default the way a checklist would.
 async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }) {
   const detectedType = calendarModule.detectAppointmentTypeFromText(text);
-  if (detectedType) negotiation = calendarModule.setAppointmentType(negotiation.id, detectedType);
+  if (detectedType) negotiation = (await calendarModule.setAppointmentType(negotiation.id, detectedType)) || negotiation;
 
   let extracted = {};
   try {
@@ -306,7 +306,7 @@ async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }
   });
 
   await reply(form);
-  calendarModule.markFormSent(negotiation.id);
+  await calendarModule.markFormSent(negotiation.id);
   await gmail.sendOwnerNotification(
     `📋 New scheduling inquiry from ${contact?.name || senderLabel}:\n` +
     `They said: "${text.substring(0, 200)}"\n` +
@@ -323,7 +323,7 @@ async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }
 // for what's still missing, not the whole form again.
 async function processIntakeReply({ negotiation, text, contact, channel, target, subject, voiceMsg, reply, adminEmail, senderLabel }) {
   const detectedType = negotiation.appointment_type ? null : calendarModule.detectAppointmentTypeFromText(text);
-  if (detectedType) negotiation = calendarModule.setAppointmentType(negotiation.id, detectedType);
+  if (detectedType) negotiation = (await calendarModule.setAppointmentType(negotiation.id, detectedType)) || negotiation;
 
   // A preferred time stated in the same breath as still-missing info ("I'm
   // free Friday at noon" while email hasn't been given yet) used to be
@@ -341,13 +341,13 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
       nextBusinessDay.setDate(nextBusinessDay.getDate() + 1);
     } while (nextBusinessDay.getDay() === 0 || nextBusinessDay.getDay() === 6);
     nextBusinessDay.setHours(8, 0, 0, 0);
-    const duration = calendarModule.getDurationForRelationship(contact?.relationship);
-    const nextSlot = calendarModule.findNextAvailableSlot({ afterDate: nextBusinessDay, durationMinutes: duration });
+    const duration = await calendarModule.getDurationForRelationship(contact?.relationship);
+    const nextSlot = await calendarModule.findNextAvailableSlot({ afterDate: nextBusinessDay, durationMinutes: duration });
     const slotText = nextSlot ? `on ${new Date(nextSlot.start).toLocaleString()}` : 'as soon as there is an opening';
     immediateReply = `I'm sorry, but all available representatives are currently busy. The next available slot is ${slotText}. `;
   } else {
     statedDate = calendarModule.parseDatetimePhrase(text);
-    if (statedDate) negotiation = calendarModule.setRequestedDatetime(negotiation.id, statedDate.toISOString()) || negotiation;
+    if (statedDate) negotiation = (await calendarModule.setRequestedDatetime(negotiation.id, statedDate.toISOString())) || negotiation;
   }
 
   let extracted = {};
@@ -357,7 +357,7 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
     log.error('index', 'Failed to extract intake reply', { error: e.message });
   }
   if (contact?.id) contacts.applyExtractedDetails(contact.id, extracted);
-  if (extracted?.concerns) calendarModule.setAppointmentNotes(negotiation.id, extracted.concerns);
+  if (extracted?.concerns) await calendarModule.setAppointmentNotes(negotiation.id, extracted.concerns);
 
   const freshContact = contact?.id ? contacts.getContactById(contact.id) : contact;
   const required = requiredFieldsForType(negotiation.appointment_type);
@@ -384,7 +384,7 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
   }
 
   const attendeeEmail = channel === 'email' ? target : (freshContact?.emails?.[0] || null);
-  const duration = calendarModule.getDurationForRelationship(freshContact?.relationship);
+  const duration = await calendarModule.getDurationForRelationship(freshContact?.relationship);
   const afterDate = calendarModule.mentionsToday(text) ? undefined : calendarModule.startOfTomorrow();
   // Prefer a date/time stated in this exact message; failing that, honor
   // whatever preference was captured earlier in the conversation
@@ -399,7 +399,7 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
       nextBusinessDay.setDate(nextBusinessDay.getDate() + 1);
     } while (nextBusinessDay.getDay() === 0 || nextBusinessDay.getDay() === 6);
     nextBusinessDay.setHours(8, 0, 0, 0);
-    const slot = calendarModule.findNextAvailableSlot({ afterDate: nextBusinessDay, durationMinutes: duration });
+    const slot = await calendarModule.findNextAvailableSlot({ afterDate: nextBusinessDay, durationMinutes: duration });
     
     if (!slot) {
       await reply("I'm sorry, but all available representatives are currently busy and I'm not able to find any open slots soon. I'll have my owner reach out directly.");
@@ -407,24 +407,24 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
       return true;
     }
     
-    calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
+    await calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
     await reply(`I'm sorry, but all available representatives are currently busy. The next available slot is on ${new Date(slot.start).toLocaleString()}. Does that work for you, or suggest another time?`);
     return true;
   }
 
   if (!requestedDate) {
-    const offers = calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3 });
+    const offers = await calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3 });
     if (offers.length === 0) {
       await reply("I'm not able to find any open slots right now — I'll have my owner reach out to schedule directly.");
       await gmail.sendOwnerNotification(`⚠️ Could not find any available slots for a scheduling request from ${senderLabel}.`);
       return true;
     }
-    calendarModule.updateNegotiationOffers(negotiation.id, offers);
+    await calendarModule.updateNegotiationOffers(negotiation.id, offers);
     await reply(`Great, thanks for the details! Here's what I have open for a ${typeLabel}:\n${calendarModule.formatOfferList(offers)}\n\nWhich works for you, or suggest another time?`);
     return true;
   }
 
-  const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate });
+  const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate });
   if (!slot) {
     await reply("I'm not able to find any open slot near that time — I'll have my owner reach out directly.");
     await gmail.sendOwnerNotification(`⚠️ Could not find an available slot while scheduling with ${senderLabel}.`);
@@ -434,7 +434,7 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
   if (slot.start.getTime() === requestedDate.getTime()) {
     await confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, senderLabel, reply });
   } else {
-    calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
+    await calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
     await reply(`Thanks for the details! That time isn't available, though — the soonest opening after that is ${new Date(slot.start).toLocaleString()}. Does that work, or would you like another time?`);
   }
   return true;
@@ -467,24 +467,24 @@ async function negotiateTime({ negotiation, text, adminEmail, senderLabel, reply
     const lastOffered = negotiation.offered_slots[negotiation.offered_slots.length - 1];
     const duration = (new Date(lastOffered.end) - new Date(lastOffered.start)) / 60000;
     const afterDate = new Date(new Date(lastOffered.end).getTime() + 15 * 60 * 1000);
-    const offers = calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3 });
+    const offers = await calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3 });
     if (offers.length === 0) {
       await reply("I don't have anything later than that open right now — would an earlier time work instead, or should I have my owner follow up?");
       return true;
     }
-    calendarModule.updateNegotiationOffers(negotiation.id, offers);
+    await calendarModule.updateNegotiationOffers(negotiation.id, offers);
     await reply(`Sure, here's what I have later:\n${calendarModule.formatOfferList(offers)}\n\nWhich works, or another time?`);
     return true;
   }
   if (relative === 'earlier') {
     const firstOffered = negotiation.offered_slots[0];
     const duration = (new Date(firstOffered.end) - new Date(firstOffered.start)) / 60000;
-    const offers = calendarModule.findEarlierSlotsSameDay({ beforeDate: firstOffered.start, durationMinutes: duration, count: 3 });
+    const offers = await calendarModule.findEarlierSlotsSameDay({ beforeDate: firstOffered.start, durationMinutes: duration, count: 3 });
     if (offers.length === 0) {
       await reply("I don't have anything earlier that same day — would a different day work, or should I have my owner follow up?");
       return true;
     }
-    calendarModule.updateNegotiationOffers(negotiation.id, offers);
+    await calendarModule.updateNegotiationOffers(negotiation.id, offers);
     await reply(`Sure, here's what I have earlier that day:\n${calendarModule.formatOfferList(offers)}\n\nWhich works, or another time?`);
     return true;
   }
@@ -504,7 +504,7 @@ async function negotiateTime({ negotiation, text, adminEmail, senderLabel, reply
 
   const duration = (new Date(negotiation.offered_slots[0].end) - new Date(negotiation.offered_slots[0].start)) / 60000;
   const afterDate = calendarModule.mentionsToday(text) ? undefined : calendarModule.startOfTomorrow();
-  const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate });
+  const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate });
 
   if (!slot) {
     await reply("I'm not able to find any open slot near that time — I'll have my owner reach out directly.");
@@ -515,7 +515,7 @@ async function negotiateTime({ negotiation, text, adminEmail, senderLabel, reply
   if (slot.start.getTime() === requestedDate.getTime()) {
     await confirmAndClose({ negotiation, slot, attendeeEmail: negotiation.attendee_email, adminEmail, senderLabel, reply });
   } else {
-    calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
+    await calendarModule.updateNegotiationOffers(negotiation.id, [slot]);
     await reply(`That time isn't available either — the soonest opening after that is ${new Date(slot.start).toLocaleString()}. Does that work, or would you like another time?`);
   }
   return true;
@@ -539,7 +539,7 @@ async function advanceScheduling({ negotiation, text, contact, channel, target, 
 
 // A fresh "move my appointment" request against an already-confirmed booking.
 async function handleRescheduleRequest({ classified, contact, reply, adminEmail, senderLabel }) {
-  const appts = calendarModule.findAppointmentsByContact(contact?.id);
+  const appts = await calendarModule.findAppointmentsByContact(contact?.id);
   if (appts.length === 0) {
     await reply("I don't see any upcoming appointment on file for you.");
     return true;
@@ -560,14 +560,14 @@ async function handleRescheduleRequest({ classified, contact, reply, adminEmail,
 
   const duration = (new Date(appt.end) - new Date(appt.start)) / 60000;
   const afterDate = calendarModule.mentionsToday(classified.raw_datetime_phrase) ? undefined : calendarModule.startOfTomorrow();
-  const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate, excludeId: appt.id });
+  const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate, excludeId: appt.id });
   if (!slot) {
     await reply("I couldn't find another open slot near that time — I'll have my owner follow up.");
     return true;
   }
 
   if (slot.start.getTime() === preferredDate.getTime()) {
-    const updated = calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
+    const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
     const details = customerDetailBlock(updated, contact?.name || senderLabel, updated.attendee_email);
     if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
     await gmail.sendCalendarInvite(updated, adminEmail,
@@ -583,7 +583,7 @@ async function handleRescheduleRequest({ classified, contact, reply, adminEmail,
   } else {
     // Their requested new time isn't free either — recommend the nearest
     // alternative but leave the current booking intact until they agree.
-    calendarModule.setPendingReschedule(appt.id, slot);
+    await calendarModule.setPendingReschedule(appt.id, slot);
     await reply(`That time isn't available. The soonest opening after that is ${new Date(slot.start).toLocaleString()} — does that work, or would you like to suggest another time?`);
   }
   return true;
@@ -602,7 +602,7 @@ async function handleRescheduleReply({ appt, text, reply, adminEmail, senderLabe
 
   const duration = (new Date(appt.end) - new Date(appt.start)) / 60000;
   const afterDate = calendarModule.mentionsToday(text) ? undefined : calendarModule.startOfTomorrow();
-  const slot = calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate, excludeId: appt.id });
+  const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate: requestedDate, excludeId: appt.id });
 
   if (!slot) {
     await reply("I'm not able to find any open slot near that time — I'll have my owner follow up.");
@@ -610,8 +610,8 @@ async function handleRescheduleReply({ appt, text, reply, adminEmail, senderLabe
   }
 
   if (slot.start.getTime() === requestedDate.getTime()) {
-    const updated = calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
-    calendarModule.clearPendingReschedule(updated.id);
+    const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
+    await calendarModule.clearPendingReschedule(updated.id);
     const details = customerDetailBlock(updated, senderLabel, updated.attendee_email);
     if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
     await gmail.sendCalendarInvite(updated, adminEmail,
@@ -625,14 +625,14 @@ async function handleRescheduleReply({ appt, text, reply, adminEmail, senderLabe
       `🔁 Appointment rescheduled for ${senderLabel}: now ${new Date(updated.start).toLocaleString()}\n\n${details}`
     );
   } else {
-    calendarModule.setPendingReschedule(appt.id, slot);
+    await calendarModule.setPendingReschedule(appt.id, slot);
     await reply(`That time isn't available either — the soonest opening after that is ${new Date(slot.start).toLocaleString()}. Does that work?`);
   }
   return true;
 }
 
 async function handleCancelRequest({ classified, contact, reply, adminEmail, senderLabel }) {
-  const appts = calendarModule.findAppointmentsByContact(contact?.id);
+  const appts = await calendarModule.findAppointmentsByContact(contact?.id);
   if (appts.length === 0) {
     await reply("I don't see any upcoming appointment on file for you.");
     return true;
@@ -645,7 +645,7 @@ async function handleCancelRequest({ classified, contact, reply, adminEmail, sen
     return true;
   }
 
-  calendarModule.cancelAppointment(appt.id);
+  await calendarModule.cancelAppointment(appt.id);
   if (appt.attendee_email) await gmail.sendCalendarCancellation(appt, appt.attendee_email);
   await gmail.sendCalendarCancellation(appt, adminEmail);
   await reply(`Done — your appointment on ${new Date(appt.start).toLocaleString()} has been cancelled. Let us know whenever you're ready to rebook.`);
@@ -677,12 +677,12 @@ async function handleSchedulingMessage({ text, contact, channel, target, subject
   // is part of it — including replies with no date/scheduling keyword at all
   // (e.g. answering "what's your address?" with just an address). Route
   // there unconditionally rather than gating on a keyword match.
-  const activeNegotiation = contact?.id ? calendarModule.findNegotiationsByContact(contact.id)[0] : null;
+  const activeNegotiation = contact?.id ? (await calendarModule.findNegotiationsByContact(contact.id))[0] : null;
   if (activeNegotiation) {
     return await advanceScheduling({ negotiation: activeNegotiation, text, contact, channel, target, subject, voiceMsg, reply, adminEmail, senderLabel });
   }
 
-  const confirmedAppts = contact?.id ? calendarModule.findAppointmentsByContact(contact.id) : [];
+  const confirmedAppts = contact?.id ? await calendarModule.findAppointmentsByContact(contact.id) : [];
   const pendingReschedule = confirmedAppts.find(a => a.pending_reschedule);
   if (pendingReschedule) {
     return await handleRescheduleReply({ appt: pendingReschedule, text, reply, adminEmail, senderLabel });
@@ -717,12 +717,12 @@ async function handleSchedulingMessage({ text, contact, channel, target, subject
     // the normal reply flow, which can just answer the question (and, once
     // it has appointment context — see generateCustomerReply/generateSmsReply/
     // generateEmailReply — can reference the existing booking naturally).
-    const existingAppt = contact?.id ? calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
+    const existingAppt = contact?.id ? await calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
     if (existingAppt) {
       log.info('index', `Skipping duplicate appointment proposal for ${senderLabel} — already has ${existingAppt.id} confirmed`);
       return false;
     }
-    const negotiation = calendarModule.proposeAppointment({
+    const negotiation = await calendarModule.proposeAppointment({
       title: `Appointment with ${contact?.name || senderLabel}`,
       contactId: contact?.id,
       attendeeName: contact?.name || senderLabel,
@@ -910,7 +910,7 @@ async function handleGoogleVoiceText(email) {
     // naturally when relevant instead of being invisible to the reply (or,
     // via the duplicate-booking guard in handleSchedulingMessage above,
     // getting silently re-proposed).
-    const upcomingAppt = contact?.id ? calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
+    const upcomingAppt = contact?.id ? await calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
     const appointmentContext = upcomingAppt ? calendarModule.formatAppointment(upcomingAppt) : null;
 
     const person = await roleRouter.resolvePersonAndRoles({
@@ -1129,9 +1129,9 @@ async function handleNewEmail(email) {
   // "Accepted: Appointment with...").
   if (gmail.isCalendarResponse(email)) {
     const rsvp = gmail.parseCalendarResponse(email);
-    const appt = rsvp.status && calendarModule.findAppointmentByAttendeeEmail(rsvp.attendeeEmail);
+    const appt = rsvp.status && (await calendarModule.findAppointmentByAttendeeEmail(rsvp.attendeeEmail));
     if (appt) {
-      calendarModule.setRsvpStatus(appt.id, rsvp.status);
+      await calendarModule.setRsvpStatus(appt.id, rsvp.status);
       const icon = rsvp.status === 'accepted' ? '✅' : rsvp.status === 'declined' ? '❌' : '❔';
       await gmail.sendOwnerNotification(
         `${icon} ${appt.attendee_name || rsvp.attendeeEmail} ${rsvp.status} the appointment: ` +
@@ -1237,7 +1237,7 @@ async function handleNewEmail(email) {
   try {
     const fullEmailContent = `${email.subject || ''}\n\n${email.body || ''}`;
     // See the matching comment in handleGoogleVoiceText — same reasoning.
-    const upcomingApptEmail = contact?.id ? calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
+    const upcomingApptEmail = contact?.id ? await calendarModule.findUpcomingAppointmentForContact(contact.id) : null;
     const appointmentContext = upcomingApptEmail ? calendarModule.formatAppointment(upcomingApptEmail) : null;
 
     const person = await roleRouter.resolvePersonAndRoles({
