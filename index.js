@@ -988,14 +988,14 @@ async function handleGoogleVoiceText(email) {
 
       let currentCust = person.customer_record;
       if (!currentCust) {
-        currentCust = customerModule.createOrUpdateCustomer({
+        currentCust = await customerModule.createOrUpdateCustomer({
           customer_name: voiceMsg.sender_name || extracted.customer_name || 'Homeowner',
           phone: voiceMsg.sender_phone,
           escalation_status: isEmergency ? 'EMERGENCY_REVIEW' : ((isEscalation || isSwearing) ? 'HUMAN_REVIEW_REQUIRED' : null),
           ...extracted
         });
       } else {
-        currentCust = customerModule.updateCustomer(currentCust.customer_id, {
+        currentCust = await customerModule.updateCustomer(currentCust.customer_id, {
           escalation_status: isEmergency ? 'EMERGENCY_REVIEW' : ((isEscalation || isSwearing) ? 'HUMAN_REVIEW_REQUIRED' : currentCust.escalation_status),
           ...extracted
         });
@@ -1319,7 +1319,7 @@ async function handleNewEmail(email) {
 
       let currentCust = person.customer_record;
       if (!currentCust) {
-        currentCust = customerModule.createOrUpdateCustomer({
+        currentCust = await customerModule.createOrUpdateCustomer({
           customer_name: email.from_name || extracted.customer_name || 'Homeowner',
           email: email.from_email,
           lead_source: 'incoming_email',
@@ -1327,7 +1327,7 @@ async function handleNewEmail(email) {
           ...extracted
         });
       } else {
-        currentCust = customerModule.updateCustomer(currentCust.customer_id, {
+        currentCust = await customerModule.updateCustomer(currentCust.customer_id, {
           escalation_status: isEmergency ? 'EMERGENCY_REVIEW' : ((isEscalation || isSwearing) ? 'HUMAN_REVIEW_REQUIRED' : currentCust.escalation_status),
           ...extracted
         });

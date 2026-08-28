@@ -1,6 +1,8 @@
 // tests/customer-module.test.js — Unit tests for Restoricon Customer Intake,
 // Sales & Support Module.
+// Cut over to Restoricon Core write-through calls (B2 task 4, CODEY_MASTER_PLAN.md §6.4).
 
+import { jest } from '@jest/globals';
 import {
   RESTORICON_INFO,
   CUSTOMER_CATEGORIES,
@@ -26,7 +28,9 @@ import {
   getCustomerById,
   findCustomer,
   updateCustomer,
-  loadCustomers
+  loadCustomers,
+  mapCoreToJS,
+  mapJSToCore
 } from '../customer-module.js';
 
 describe('Restoricon Customer Module — Positioning & Knowledge Base', () => {
@@ -192,9 +196,201 @@ describe('Human Handoff & Prompt Generation', () => {
   });
 });
 
-describe('CRM State & Reporting Operations', () => {
-  it('creates and updates customer CRM records', () => {
-    const newCust = createOrUpdateCustomer({
+describe('Mapping: mapCoreToJS & mapJSToCore (~46 fields)', () => {
+  it('correctly round-trips rich customer attributes between Core and JS', () => {
+    const jsOriginal = {
+      id: 42,
+      customer_id: 'CUST-TEST-42',
+      customer_name: 'Jane Doe',
+      preferred_name: 'Janie',
+      phone: '860-555-1234',
+      email: 'jane@example.com',
+      property_address: '123 Main St',
+      city: 'Hartford',
+      state: 'CT',
+      zip: '06103',
+      property_type: 'Single-family',
+      owner_status: true,
+      occupancy_status: 'Occupied',
+      customer_category: 'NEW_CUSTOMER',
+      project_category: 'remodeling',
+      project_type: 'kitchen_remodeling',
+      project_description: 'Full remodel',
+      customer_goal: 'Modernize kitchen',
+      rooms_affected: ['kitchen', 'dining'],
+      approximate_size: '300 sq ft',
+      materials_requested: 'Quartz countertops',
+      design_needed: true,
+      project_urgency: 'High',
+      desired_start_date: '2026-10-01',
+      desired_completion_date: '2026-12-01',
+      customer_budget: '$45,000',
+      insurance_related: false,
+      insurance_company: null,
+      claim_number: null,
+      adjuster: null,
+      incident_date: null,
+      photos_received: ['k1.jpg'],
+      documents_received: ['floorplan.pdf'],
+      lead_source: 'website',
+      lead_status: 'QUALIFIED',
+      lead_score: 'HOT',
+      appointment_date: '2026-09-15',
+      appointment_time: '10:00 AM',
+      appointment_status: 'CONFIRMED',
+      last_contact: '2026-08-28T00:00:00Z',
+      next_followup: '2026-09-01T00:00:00Z',
+      contact_preference: 'sms',
+      best_contact_time: 'mornings',
+      customer_notes: ['First consultation complete'],
+      dnc_status: false,
+      escalation_status: null,
+      created_at: '2026-08-01T00:00:00Z',
+      updated_at: '2026-08-28T00:00:00Z'
+    };
+
+    const coreMapped = mapJSToCore(jsOriginal);
+    expect(coreMapped.first_name).toBe('Jane');
+    expect(coreMapped.last_name).toBe('Doe');
+    expect(coreMapped.external_id).toBe('CUST-TEST-42');
+    expect(coreMapped.custom_fields.customer_budget).toBe('$45,000');
+    expect(coreMapped.custom_fields.rooms_affected).toEqual(['kitchen', 'dining']);
+
+    const jsRestored = mapCoreToJS(coreMapped);
+    expect(jsRestored.customer_id).toBe(jsOriginal.customer_id);
+    expect(jsRestored.customer_name).toBe(jsOriginal.customer_name);
+    expect(jsRestored.preferred_name).toBe(jsOriginal.preferred_name);
+    expect(jsRestored.phone).toBe(jsOriginal.phone);
+    expect(jsRestored.email).toBe(jsOriginal.email);
+    expect(jsRestored.property_address).toBe(jsOriginal.property_address);
+    expect(jsRestored.city).toBe(jsOriginal.city);
+    expect(jsRestored.customer_budget).toBe(jsOriginal.customer_budget);
+    expect(jsRestored.rooms_affected).toEqual(jsOriginal.rooms_affected);
+    expect(jsRestored.appointment_date).toBe(jsOriginal.appointment_date);
+    expect(jsRestored.customer_notes).toEqual(jsOriginal.customer_notes);
+  });
+});
+
+describe('CRM State & Reporting Operations (Core write-through)', () => {
+  let fetchSpy;
+
+  beforeEach(() => {
+    fetchSpy = jest.spyOn(global, 'fetch');
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  function mockResponse(status, body) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body
+    };
+  }
+
+  it('loadCustomers fetches all customers from Core API', async () => {
+    const coreList = [
+      {
+        id: 1,
+        external_id: 'CUST-001',
+        first_name: 'Alice',
+        last_name: 'Johnson',
+        phone: '8602223344',
+        email: 'alice@test.com',
+        custom_fields: { customer_name: 'Alice Johnson', lead_score: 'HOT', lead_status: 'NEW' }
+      },
+      {
+        id: 2,
+        external_id: 'CUST-002',
+        first_name: 'Bob',
+        last_name: 'Smith',
+        phone: '8605554321',
+        email: 'bob@test.com',
+        custom_fields: { customer_name: 'Bob Smith', lead_score: 'WARM', lead_status: 'QUALIFIED' }
+      }
+    ];
+
+    fetchSpy.mockResolvedValue(mockResponse(200, { customers: coreList }));
+
+    const customers = await loadCustomers();
+    expect(customers).toHaveLength(2);
+    expect(customers[0].customer_id).toBe('CUST-001');
+    expect(customers[0].customer_name).toBe('Alice Johnson');
+    expect(customers[1].customer_id).toBe('CUST-002');
+    expect(customers[1].customer_name).toBe('Bob Smith');
+
+    const [url, options] = fetchSpy.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/customers');
+    expect(options.method).toBe('GET');
+    expect(options.headers.Authorization).toMatch(/^Bearer /);
+  });
+
+  it('findCustomer queries Core search endpoint and returns mapped customer', async () => {
+    const coreCustomer = {
+      id: 1,
+      external_id: 'CUST-001',
+      first_name: 'Alice',
+      last_name: 'Johnson',
+      phone: '8602223344',
+      email: 'alice@test.com',
+      custom_fields: { customer_name: 'Alice Johnson' }
+    };
+
+    fetchSpy.mockResolvedValue(mockResponse(200, { customer: coreCustomer }));
+
+    const found = await findCustomer('alice@test.com');
+    expect(found).toBeDefined();
+    expect(found.customer_id).toBe('CUST-001');
+    expect(found.customer_name).toBe('Alice Johnson');
+
+    const [url] = fetchSpy.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/customers/search?q=alice%40test.com');
+  });
+
+  it('getCustomerById queries by numeric ID or delegates to search', async () => {
+    const coreCustomer = {
+      id: 10,
+      external_id: 'CUST-010',
+      first_name: 'David',
+      last_name: 'Clark',
+      custom_fields: { customer_name: 'David Clark' }
+    };
+
+    fetchSpy.mockResolvedValue(mockResponse(200, { customer: coreCustomer }));
+
+    const found = await getCustomerById(10);
+    expect(found.customer_id).toBe('CUST-010');
+    expect(found.customer_name).toBe('David Clark');
+
+    const [url] = fetchSpy.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/customers/10');
+  });
+
+  it('createOrUpdateCustomer upserts via Core API when customer_id is provided', async () => {
+    const createdCore = {
+      id: 5,
+      external_id: 'CUST-NEW-001',
+      first_name: 'Alice',
+      last_name: 'Johnson',
+      phone: '8602223344',
+      email: 'alice@restoricon-test.com',
+      service_address: '100 Main St',
+      custom_fields: {
+        customer_name: 'Alice Johnson',
+        property_address: '100 Main St',
+        city: 'Hartford',
+        state: 'CT',
+        project_category: 'remodeling',
+        project_type: 'kitchen_remodeling'
+      }
+    };
+
+    fetchSpy.mockResolvedValue(mockResponse(200, { customer: createdCore }));
+
+    const newCust = await createOrUpdateCustomer({
+      customer_id: 'CUST-NEW-001',
       customer_name: 'Alice Johnson',
       phone: '8602223344',
       email: 'alice@restoricon-test.com',
@@ -207,21 +403,89 @@ describe('CRM State & Reporting Operations', () => {
     });
 
     expect(newCust).toBeDefined();
-    expect(newCust.customer_id).toBeDefined();
+    expect(newCust.customer_id).toBe('CUST-NEW-001');
     expect(newCust.customer_name).toBe('Alice Johnson');
 
-    const found = findCustomer('alice@restoricon-test.com');
-    expect(found).toBeDefined();
-    expect(found.customer_id).toBe(newCust.customer_id);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, options] = fetchSpy.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/customers/upsert');
+    expect(options.method).toBe('POST');
+  });
 
-    const updated = updateCustomer(newCust.customer_id, {
+  it('createOrUpdateCustomer searches before upsert when customer_id is omitted', async () => {
+    const foundCore = {
+      id: 5,
+      external_id: 'CUST-EXISTING-99',
+      first_name: 'Alice',
+      last_name: 'Johnson',
+      phone: '8602223344',
+      email: 'alice@restoricon-test.com',
+      custom_fields: {
+        customer_name: 'Alice Johnson'
+      }
+    };
+
+    const updatedCore = {
+      ...foundCore,
+      custom_fields: {
+        ...foundCore.custom_fields,
+        project_description: 'Updated scope'
+      }
+    };
+
+    // First search lookup
+    fetchSpy.mockResolvedValueOnce(mockResponse(200, { customer: foundCore }));
+    // Upsert call
+    fetchSpy.mockResolvedValueOnce(mockResponse(200, { customer: updatedCore }));
+
+    const res = await createOrUpdateCustomer({
+      phone: '8602223344',
+      project_description: 'Updated scope'
+    });
+
+    expect(res).toBeDefined();
+    expect(res.customer_id).toBe('CUST-EXISTING-99');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('updateCustomer updates via Core API numeric ID or upsert', async () => {
+    const existingCore = {
+      id: 5,
+      external_id: 'CUST-NEW-001',
+      first_name: 'Alice',
+      last_name: 'Johnson',
+      custom_fields: { customer_name: 'Alice Johnson' }
+    };
+
+    const updatedCore = {
+      id: 5,
+      external_id: 'CUST-NEW-001',
+      first_name: 'Alice',
+      last_name: 'Johnson',
+      status: 'active',
+      custom_fields: {
+        customer_name: 'Alice Johnson',
+        lead_status: 'APPOINTMENT_SCHEDULED',
+        appointment_date: '2026-09-05'
+      }
+    };
+
+    // getCustomerById lookup
+    fetchSpy.mockResolvedValueOnce(mockResponse(200, { customer: existingCore }));
+    // update endpoint
+    fetchSpy.mockResolvedValueOnce(mockResponse(200, { customer: updatedCore }));
+
+    const updated = await updateCustomer('CUST-NEW-001', {
       lead_status: LEAD_STATUSES.APPOINTMENT_SCHEDULED,
-      appointment_date: '2026-09-05',
-      appointment_time: '2:00 PM'
+      appointment_date: '2026-09-05'
     });
 
     expect(updated.lead_status).toBe(LEAD_STATUSES.APPOINTMENT_SCHEDULED);
     expect(updated.appointment_date).toBe('2026-09-05');
+
+    const [url, options] = fetchSpy.mock.calls[1];
+    expect(String(url)).toContain('/api/v1/customers/upsert');
+    expect(options.method).toBe('POST');
   });
 
   it('formats customer profile summary', () => {
@@ -248,13 +512,45 @@ describe('CRM State & Reporting Operations', () => {
     expect(summary).toContain('HOT');
   });
 
-  it('formats customer pipeline report and followup list', () => {
-    const report = formatCustomerPipelineReport();
-    expect(typeof report).toBe('string');
-    expect(report.length).toBeGreaterThan(0);
+  it('formats customer pipeline report and followup list from Core API data', async () => {
+    const mockList = [
+      {
+        id: 1,
+        external_id: 'CUST-001',
+        first_name: 'Alice',
+        last_name: 'Johnson',
+        custom_fields: {
+          customer_name: 'Alice Johnson',
+          lead_status: 'NEW',
+          lead_score: 'HOT',
+          next_followup: '2026-09-01'
+        }
+      },
+      {
+        id: 2,
+        external_id: 'CUST-002',
+        first_name: 'Bob',
+        last_name: 'Smith',
+        custom_fields: {
+          customer_name: 'Bob Smith',
+          lead_status: 'FOLLOW_UP',
+          lead_score: 'WARM'
+        }
+      }
+    ];
 
-    const followups = formatCustomerFollowupList();
+    fetchSpy.mockResolvedValue(mockResponse(200, { customers: mockList }));
+
+    const report = await formatCustomerPipelineReport();
+    expect(typeof report).toBe('string');
+    expect(report).toContain('Restoricon Customer Pipeline Report (2 Total)');
+    expect(report).toContain('HOT: 1');
+    expect(report).toContain('WARM: 1');
+
+    const followups = await formatCustomerFollowupList();
     expect(typeof followups).toBe('string');
-    expect(followups.length).toBeGreaterThan(0);
+    expect(followups).toContain('Restoricon Customer Follow-Up Queue (2)');
+    expect(followups).toContain('Alice Johnson');
+    expect(followups).toContain('Bob Smith');
   });
 });

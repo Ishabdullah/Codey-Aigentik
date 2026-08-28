@@ -3,13 +3,12 @@
 // Inquiry -> Qualification -> Project Assessment -> Estimate Scheduling ->
 // Support -> Change Requests -> Escalations -> Human Handoff -> CRM State Tracking.
 
-import fs from 'fs';
-import path from 'path';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 
-const DATA_DIR = config.paths?.data_dir || './data';
-const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+const LIST_LIMIT = 1000;
 
 // --- Restoricon Core Positioning & Context ---
 export const RESTORICON_INFO = {
@@ -361,36 +360,230 @@ const ESCALATION_KEYWORDS = [
   'manager', 'boss', 'supervisor', 'executive'
 ];
 
-// --- Storage / CRM Operations ---
+// --- Storage / CRM Operations (Core API) ---
 
-export function loadCustomers() {
-  try {
-    if (!fs.existsSync(CUSTOMERS_FILE)) {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(CUSTOMERS_FILE, JSON.stringify([], null, 2));
-      return [];
-    }
-    const data = fs.readFileSync(CUSTOMERS_FILE, 'utf8');
-    return JSON.parse(data || '[]');
-  } catch (err) {
-    log.error('customer-module', 'Failed to load customers.json', { error: err.message });
-    return [];
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('customer-module: config.core_api.base_url/token not configured');
   }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('customer-module', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
+}
+
+export function mapCoreToJS(coreObj) {
+  if (!coreObj) return null;
+  const custom = coreObj.custom_fields || {};
+  const fullName = `${coreObj.first_name || ''} ${coreObj.last_name || ''}`.trim() || 'Prospective Customer';
+
+  const jsObj = {
+    id: coreObj.id,
+    customer_id: coreObj.external_id || (coreObj.id ? `CUST-${coreObj.id}` : null),
+    customer_name: custom.customer_name || fullName,
+    preferred_name: custom.preferred_name || null,
+    first_name: coreObj.first_name,
+    last_name: coreObj.last_name,
+    company_name: coreObj.company_name || null,
+    phone: coreObj.phone || null,
+    email: coreObj.email || null,
+    property_address: custom.property_address || coreObj.service_address || coreObj.mailing_address || null,
+    service_address: coreObj.service_address || null,
+    mailing_address: coreObj.mailing_address || null,
+    city: custom.city || null,
+    state: custom.state || 'CT',
+    zip: custom.zip || null,
+    property_type: custom.property_type || PROPERTY_TYPES.SINGLE_FAMILY,
+    owner_status: custom.owner_status ?? true,
+    occupancy_status: custom.occupancy_status || 'Occupied',
+
+    customer_category: custom.customer_category || (coreObj.customer_type === 'commercial' ? CUSTOMER_CATEGORIES.COMMERCIAL_INQUIRY : CUSTOMER_CATEGORIES.NEW_CUSTOMER),
+    project_category: custom.project_category || PROJECT_CATEGORIES.REMODELING,
+    project_type: custom.project_type || null,
+    project_description: custom.project_description || null,
+    customer_goal: custom.customer_goal || null,
+    rooms_affected: custom.rooms_affected || [],
+    approximate_size: custom.approximate_size || null,
+    materials_requested: custom.materials_requested || null,
+    design_needed: custom.design_needed ?? false,
+
+    project_urgency: custom.project_urgency || 'Standard',
+    desired_start_date: custom.desired_start_date || null,
+    desired_completion_date: custom.desired_completion_date || null,
+    customer_budget: custom.customer_budget || null,
+
+    insurance_related: custom.insurance_related ?? false,
+    insurance_company: custom.insurance_company || null,
+    claim_number: custom.claim_number || null,
+    adjuster: custom.adjuster || null,
+    incident_date: custom.incident_date || null,
+
+    photos_received: custom.photos_received || [],
+    documents_received: custom.documents_received || [],
+
+    lead_source: custom.lead_source || coreObj.customer_source || 'inbound',
+    lead_status: custom.lead_status || (coreObj.status ? coreObj.status.toUpperCase() : LEAD_STATUSES.NEW),
+    lead_score: custom.lead_score || LEAD_SCORES.HOT,
+
+    appointment_date: custom.appointment_date || null,
+    appointment_time: custom.appointment_time || null,
+    appointment_status: custom.appointment_status || null,
+
+    last_contact: coreObj.last_contact_at || custom.last_contact || null,
+    next_followup: coreObj.next_followup_at || custom.next_followup || null,
+    contact_preference: custom.contact_preference || 'sms',
+    best_contact_time: custom.best_contact_time || null,
+
+    customer_notes: custom.customer_notes || (coreObj.notes ? [coreObj.notes] : []),
+    dnc_status: custom.dnc_status ?? false,
+    escalation_status: custom.escalation_status || null,
+    created_at: coreObj.created_at || custom.created_at || new Date().toISOString(),
+    updated_at: custom.updated_at || coreObj.created_at || new Date().toISOString(),
+    tags: coreObj.tags || [],
+    custom_fields: custom
+  };
+
+  return jsObj;
+}
+
+export function mapJSToCore(jsObj) {
+  if (!jsObj) return null;
+
+  let firstName = jsObj.first_name || '';
+  let lastName = jsObj.last_name || '';
+  if (!firstName && !lastName && jsObj.customer_name) {
+    const parts = jsObj.customer_name.trim().split(/\s+/);
+    firstName = parts[0] || '';
+    lastName = parts.slice(1).join(' ') || '';
+  }
+  if (!firstName && !lastName) {
+    firstName = 'Prospective';
+    lastName = 'Customer';
+  }
+
+  const customFields = {
+    ...(jsObj.custom_fields || {}),
+    customer_name: jsObj.customer_name || `${firstName} ${lastName}`.trim(),
+    preferred_name: jsObj.preferred_name || null,
+    property_address: jsObj.property_address || null,
+    city: jsObj.city || null,
+    state: jsObj.state || 'CT',
+    zip: jsObj.zip || null,
+    property_type: jsObj.property_type || PROPERTY_TYPES.SINGLE_FAMILY,
+    owner_status: jsObj.owner_status ?? true,
+    occupancy_status: jsObj.occupancy_status || 'Occupied',
+
+    customer_category: jsObj.customer_category || CUSTOMER_CATEGORIES.NEW_CUSTOMER,
+    project_category: jsObj.project_category || PROJECT_CATEGORIES.REMODELING,
+    project_type: jsObj.project_type || null,
+    project_description: jsObj.project_description || null,
+    customer_goal: jsObj.customer_goal || null,
+    rooms_affected: jsObj.rooms_affected || [],
+    approximate_size: jsObj.approximate_size || null,
+    materials_requested: jsObj.materials_requested || null,
+    design_needed: jsObj.design_needed ?? false,
+
+    project_urgency: jsObj.project_urgency || 'Standard',
+    desired_start_date: jsObj.desired_start_date || null,
+    desired_completion_date: jsObj.desired_completion_date || null,
+    customer_budget: jsObj.customer_budget || null,
+
+    insurance_related: jsObj.insurance_related ?? false,
+    insurance_company: jsObj.insurance_company || null,
+    claim_number: jsObj.claim_number || null,
+    adjuster: jsObj.adjuster || null,
+    incident_date: jsObj.incident_date || null,
+
+    photos_received: jsObj.photos_received || [],
+    documents_received: jsObj.documents_received || [],
+
+    lead_source: jsObj.lead_source || 'inbound',
+    lead_status: jsObj.lead_status || LEAD_STATUSES.NEW,
+    lead_score: jsObj.lead_score || LEAD_SCORES.HOT,
+
+    appointment_date: jsObj.appointment_date || null,
+    appointment_time: jsObj.appointment_time || null,
+    appointment_status: jsObj.appointment_status || null,
+
+    last_contact: jsObj.last_contact || null,
+    next_followup: jsObj.next_followup || null,
+    contact_preference: jsObj.contact_preference || 'sms',
+    best_contact_time: jsObj.best_contact_time || null,
+
+    customer_notes: jsObj.customer_notes || [],
+    dnc_status: jsObj.dnc_status ?? false,
+    escalation_status: jsObj.escalation_status || null,
+    created_at: jsObj.created_at || new Date().toISOString(),
+    updated_at: jsObj.updated_at || new Date().toISOString()
+  };
+
+  let notes = jsObj.notes;
+  if (!notes && Array.isArray(jsObj.customer_notes) && jsObj.customer_notes.length > 0) {
+    notes = jsObj.customer_notes.join('\n');
+  }
+
+  const coreObj = {
+    id: jsObj.id || undefined,
+    external_id: jsObj.customer_id || undefined,
+    first_name: firstName,
+    last_name: lastName,
+    company_name: jsObj.company_name || null,
+    phone: jsObj.phone || null,
+    email: jsObj.email || null,
+    mailing_address: jsObj.mailing_address || jsObj.property_address || null,
+    service_address: jsObj.service_address || jsObj.property_address || null,
+    customer_type: jsObj.customer_type || (jsObj.customer_category === 'COMMERCIAL_INQUIRY' || jsObj.property_type === 'Commercial' ? 'commercial' : 'residential'),
+    customer_source: jsObj.customer_source || jsObj.lead_source || null,
+    status: jsObj.status || (jsObj.lead_status === 'WON' ? 'active' : jsObj.lead_status === 'LOST' ? 'lost' : 'lead'),
+    tags: jsObj.tags || [],
+    notes: notes || null,
+    custom_fields: customFields,
+    created_at: jsObj.created_at || undefined,
+    last_contact_at: jsObj.last_contact || jsObj.last_contact_at || null,
+    next_followup_at: jsObj.next_followup || jsObj.next_followup_at || null
+  };
+
+  return coreObj;
+}
+
+export async function loadCustomers() {
+  const { ok, status, data, parseError } = await coreRequest('GET', '/api/v1/customers', {
+    query: { limit: LIST_LIMIT }
+  });
+  if (!ok) {
+    throw new Error(`Core customers list failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  }
+  return (data.customers || []).map(mapCoreToJS);
 }
 
 export function saveCustomers(customers) {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(CUSTOMERS_FILE, JSON.stringify(customers, null, 2));
-    return true;
-  } catch (err) {
-    log.error('customer-module', 'Failed to save customers.json', { error: err.message });
-    return false;
-  }
+  // Deprecated: mutations write through to Core API directly.
+  return true;
 }
 
 export function generateCustomerId() {
@@ -399,145 +592,147 @@ export function generateCustomerId() {
   return `CUST-${timestamp}-${randomPart}`;
 }
 
-export function findCustomer(query, customersList = null) {
+export async function findCustomer(query, customersList = null) {
   if (!query) return null;
-  const customers = customersList || loadCustomers();
-  const q = String(query).toLowerCase().trim();
-  const digits = q.replace(/\D/g, '');
+  if (customersList) {
+    const q = String(query).toLowerCase().trim();
+    const digits = q.replace(/\D/g, '');
 
-  return customers.find(c => {
-    if (c.customer_id && c.customer_id.toLowerCase() === q) return true;
-    if (c.phone && digits.length >= 7 && c.phone.replace(/\D/g, '').includes(digits)) return true;
-    if (c.email && c.email.toLowerCase() === q) return true;
-    if (c.customer_name && c.customer_name.toLowerCase().includes(q)) return true;
-    if (c.property_address && c.property_address.toLowerCase().includes(q)) return true;
-    return false;
-  }) || null;
-}
-
-export function getCustomerById(customerId) {
-  const customers = loadCustomers();
-  return customers.find(c => c.customer_id === customerId) || null;
-}
-
-export function createOrUpdateCustomer(leadData) {
-  const customers = loadCustomers();
-  let existingIndex = -1;
-
-  if (leadData.customer_id) {
-    existingIndex = customers.findIndex(c => c.customer_id === leadData.customer_id);
+    return customersList.find(c => {
+      if (c.customer_id && c.customer_id.toLowerCase() === q) return true;
+      if (c.phone && digits.length >= 7 && c.phone.replace(/\D/g, '').includes(digits)) return true;
+      if (c.email && c.email.toLowerCase() === q) return true;
+      if (c.customer_name && c.customer_name.toLowerCase().includes(q)) return true;
+      if (c.property_address && c.property_address.toLowerCase().includes(q)) return true;
+      return false;
+    }) || null;
   }
 
-  if (existingIndex === -1 && leadData.phone) {
-    const digits = leadData.phone.replace(/\D/g, '');
-    if (digits.length >= 7) {
-      existingIndex = customers.findIndex(c => c.phone && c.phone.replace(/\D/g, '').includes(digits));
+  const { ok, data } = await coreRequest('GET', '/api/v1/customers/search', { query: { q: String(query) } });
+  if (ok && data?.customer) {
+    return mapCoreToJS(data.customer);
+  }
+  return null;
+}
+
+export async function getCustomerById(customerId) {
+  if (!customerId) return null;
+  if (typeof customerId === 'number' || /^\d+$/.test(String(customerId))) {
+    const { ok, data } = await coreRequest('GET', `/api/v1/customers/${customerId}`);
+    if (ok && data?.customer) {
+      return mapCoreToJS(data.customer);
+    }
+  }
+  return await findCustomer(customerId);
+}
+
+export async function createOrUpdateCustomer(leadData) {
+  const now = new Date().toISOString();
+  let externalId = leadData.customer_id;
+  let existing = null;
+
+  if (!externalId) {
+    existing = (leadData.phone || leadData.email || leadData.customer_name)
+      ? await findCustomer(leadData.phone || leadData.email || leadData.customer_name)
+      : null;
+    if (existing && existing.customer_id) {
+      externalId = existing.customer_id;
+    } else {
+      externalId = generateCustomerId();
     }
   }
 
-  if (existingIndex === -1 && leadData.email) {
-    existingIndex = customers.findIndex(c => c.email && c.email.toLowerCase() === leadData.email.toLowerCase());
+  const record = {
+    ...(existing || {}),
+    ...leadData,
+    customer_id: externalId,
+    customer_name: leadData.customer_name || existing?.customer_name || 'Prospective Customer',
+    preferred_name: leadData.preferred_name ?? existing?.preferred_name ?? null,
+    phone: leadData.phone ?? existing?.phone ?? null,
+    email: leadData.email ?? existing?.email ?? null,
+    property_address: leadData.property_address ?? existing?.property_address ?? null,
+    city: leadData.city ?? existing?.city ?? null,
+    state: leadData.state ?? existing?.state ?? 'CT',
+    zip: leadData.zip ?? existing?.zip ?? null,
+    property_type: leadData.property_type ?? existing?.property_type ?? PROPERTY_TYPES.SINGLE_FAMILY,
+    owner_status: leadData.owner_status ?? existing?.owner_status ?? true,
+    occupancy_status: leadData.occupancy_status ?? existing?.occupancy_status ?? 'Occupied',
+
+    customer_category: leadData.customer_category ?? existing?.customer_category ?? CUSTOMER_CATEGORIES.NEW_CUSTOMER,
+    project_category: leadData.project_category ?? existing?.project_category ?? PROJECT_CATEGORIES.REMODELING,
+    project_type: leadData.project_type ?? existing?.project_type ?? null,
+    project_description: leadData.project_description ?? existing?.project_description ?? null,
+    customer_goal: leadData.customer_goal ?? existing?.customer_goal ?? null,
+    rooms_affected: leadData.rooms_affected ?? existing?.rooms_affected ?? [],
+    approximate_size: leadData.approximate_size ?? existing?.approximate_size ?? null,
+    materials_requested: leadData.materials_requested ?? existing?.materials_requested ?? null,
+    design_needed: leadData.design_needed ?? existing?.design_needed ?? false,
+
+    project_urgency: leadData.project_urgency ?? existing?.project_urgency ?? 'Standard',
+    desired_start_date: leadData.desired_start_date ?? existing?.desired_start_date ?? null,
+    desired_completion_date: leadData.desired_completion_date ?? existing?.desired_completion_date ?? null,
+    customer_budget: leadData.customer_budget ?? existing?.customer_budget ?? null,
+
+    insurance_related: leadData.insurance_related ?? existing?.insurance_related ?? false,
+    insurance_company: leadData.insurance_company ?? existing?.insurance_company ?? null,
+    claim_number: leadData.claim_number ?? existing?.claim_number ?? null,
+    adjuster: leadData.adjuster ?? existing?.adjuster ?? null,
+    incident_date: leadData.incident_date ?? existing?.incident_date ?? null,
+
+    photos_received: leadData.photos_received ?? existing?.photos_received ?? [],
+    documents_received: leadData.documents_received ?? existing?.documents_received ?? [],
+
+    lead_source: leadData.lead_source ?? existing?.lead_source ?? 'inbound',
+    lead_status: leadData.lead_status ?? existing?.lead_status ?? LEAD_STATUSES.NEW,
+    lead_score: LEAD_SCORES.HOT,
+
+    appointment_date: leadData.appointment_date ?? existing?.appointment_date ?? null,
+    appointment_time: leadData.appointment_time ?? existing?.appointment_time ?? null,
+    appointment_status: leadData.appointment_status ?? existing?.appointment_status ?? null,
+
+    last_contact: now,
+    next_followup: leadData.next_followup ?? existing?.next_followup ?? null,
+    contact_preference: leadData.contact_preference ?? existing?.contact_preference ?? 'sms',
+    best_contact_time: leadData.best_contact_time ?? existing?.best_contact_time ?? null,
+
+    customer_notes: leadData.customer_notes ?? existing?.customer_notes ?? [],
+    dnc_status: leadData.dnc_status ?? existing?.dnc_status ?? false,
+    escalation_status: leadData.escalation_status ?? existing?.escalation_status ?? null,
+    created_at: existing?.created_at || now,
+    updated_at: now
+  };
+
+  record.lead_score = calculateLeadScore(record);
+  const mapped = mapJSToCore(record);
+  const { ok, data: resData, status, parseError } = await coreRequest('POST', '/api/v1/customers/upsert', { body: mapped });
+
+  if (!ok) {
+    log.error('customer-module', 'Failed to upsert customer', { status });
+    throw new Error(`Core customer upsert failed (${status}): ${resData?.error || parseError?.message || 'unknown error'}`);
   }
 
-  const now = new Date().toISOString();
-
-  if (existingIndex >= 0) {
-    const updated = {
-      ...customers[existingIndex],
-      ...leadData,
-      last_contact: now,
-      updated_at: now
-    };
-    updated.lead_score = calculateLeadScore(updated);
-    customers[existingIndex] = updated;
-    saveCustomers(customers);
-    log.info('customer-module', 'Updated customer record', { customerId: updated.customer_id, name: updated.customer_name });
-    return updated;
-  } else {
-    const newCustomer = {
-      customer_id: leadData.customer_id || generateCustomerId(),
-      customer_name: leadData.customer_name || 'Prospective Customer',
-      preferred_name: leadData.preferred_name || null,
-      phone: leadData.phone || null,
-      email: leadData.email || null,
-      property_address: leadData.property_address || null,
-      city: leadData.city || null,
-      state: leadData.state || 'CT',
-      zip: leadData.zip || null,
-      property_type: leadData.property_type || PROPERTY_TYPES.SINGLE_FAMILY,
-      owner_status: leadData.owner_status ?? true,
-      occupancy_status: leadData.occupancy_status || 'Occupied',
-
-      customer_category: leadData.customer_category || CUSTOMER_CATEGORIES.NEW_CUSTOMER,
-      project_category: leadData.project_category || PROJECT_CATEGORIES.REMODELING,
-      project_type: leadData.project_type || null,
-      project_description: leadData.project_description || null,
-      customer_goal: leadData.customer_goal || null,
-      rooms_affected: leadData.rooms_affected || [],
-      approximate_size: leadData.approximate_size || null,
-      materials_requested: leadData.materials_requested || null,
-      design_needed: leadData.design_needed ?? false,
-
-      project_urgency: leadData.project_urgency || 'Standard',
-      desired_start_date: leadData.desired_start_date || null,
-      desired_completion_date: leadData.desired_completion_date || null,
-      customer_budget: leadData.customer_budget || null,
-
-      insurance_related: leadData.insurance_related ?? false,
-      insurance_company: leadData.insurance_company || null,
-      claim_number: leadData.claim_number || null,
-      adjuster: leadData.adjuster || null,
-      incident_date: leadData.incident_date || null,
-
-      photos_received: leadData.photos_received || [],
-      documents_received: leadData.documents_received || [],
-
-      lead_source: leadData.lead_source || 'inbound',
-      lead_status: leadData.lead_status || LEAD_STATUSES.NEW,
-      lead_score: LEAD_SCORES.HOT,
-
-      appointment_date: leadData.appointment_date || null,
-      appointment_time: leadData.appointment_time || null,
-      appointment_status: leadData.appointment_status || null,
-
-      last_contact: now,
-      next_followup: leadData.next_followup || null,
-      contact_preference: leadData.contact_preference || 'sms',
-      best_contact_time: leadData.best_contact_time || null,
-
-      customer_notes: leadData.customer_notes || [],
-      dnc_status: leadData.dnc_status ?? false,
-      escalation_status: leadData.escalation_status || null,
-      created_at: now,
-      updated_at: now
-    };
-
-    newCustomer.lead_score = calculateLeadScore(newCustomer);
-    customers.push(newCustomer);
-    saveCustomers(customers);
-    log.info('customer-module', 'Created new customer record', { customerId: newCustomer.customer_id, name: newCustomer.customer_name });
-    return newCustomer;
-  }
+  const finalRecord = resData?.customer ? mapCoreToJS(resData.customer) : mapCoreToJS(resData) || record;
+  log.info('customer-module', existing ? 'Updated customer record' : 'Created new customer record', { customerId: finalRecord.customer_id, name: finalRecord.customer_name });
+  return finalRecord;
 }
 
-export function updateCustomer(customerId, fields) {
-  const customers = loadCustomers();
-  const index = customers.findIndex(c => c.customer_id === customerId);
-  if (index === -1) return null;
+export async function updateCustomer(customerId, fields) {
+  if (!customerId) return null;
+  let existing = await getCustomerById(customerId);
+  if (!existing) return null;
 
   const updated = {
-    ...customers[index],
+    ...existing,
     ...fields,
     updated_at: new Date().toISOString()
   };
   if (fields.customer_notes && Array.isArray(fields.customer_notes)) {
-    updated.customer_notes = [...(customers[index].customer_notes || []), ...fields.customer_notes];
+    updated.customer_notes = [...(existing.customer_notes || []), ...fields.customer_notes];
   }
 
   updated.lead_score = calculateLeadScore(updated);
-  customers[index] = updated;
-  saveCustomers(customers);
-  return updated;
+
+  return await createOrUpdateCustomer(updated);
 }
 
 // --- Intelligence: Emergency & Escalation Detection ---
@@ -731,8 +926,8 @@ export function formatCustomerSummary(customer) {
   ].join('\n');
 }
 
-export function formatCustomerPipelineReport() {
-  const customers = loadCustomers();
+export async function formatCustomerPipelineReport() {
+  const customers = await loadCustomers();
   if (customers.length === 0) {
     return 'No customers currently in the CRM pipeline.';
   }
@@ -772,8 +967,8 @@ export function formatCustomerPipelineReport() {
   return lines.join('\n');
 }
 
-export function formatCustomerFollowupList() {
-  const customers = loadCustomers();
+export async function formatCustomerFollowupList() {
+  const customers = await loadCustomers();
   const followups = customers.filter(c => c.next_followup || c.lead_status === LEAD_STATUSES.FOLLOW_UP || c.lead_status === LEAD_STATUSES.DECISION_PENDING);
 
   if (followups.length === 0) {

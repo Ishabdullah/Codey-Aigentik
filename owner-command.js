@@ -320,19 +320,19 @@ async function handleOwnerCommand(sms) {
 
   // Show customer CRM pipeline report
   if (lower === 'customers' || lower === 'customer pipeline' || lower === 'customer leads') {
-    reply(customerModule.formatCustomerPipelineReport());
+    reply(await customerModule.formatCustomerPipelineReport());
     return;
   }
 
   // Show pending customer follow-ups
   if (lower === 'customer followups' || lower === 'customer follow-ups' || lower === 'client followups') {
-    reply(customerModule.formatCustomerFollowupList());
+    reply(await customerModule.formatCustomerFollowupList());
     return;
   }
 
   // Show hot leads
   if (lower === 'hot leads' || lower === 'hot customers') {
-    const custs = customerModule.loadCustomers().filter(c => c.lead_score === 'HOT');
+    const custs = (await customerModule.loadCustomers()).filter(c => c.lead_score === 'HOT');
     if (custs.length === 0) {
       reply('No HOT leads currently in pipeline.');
     } else {
@@ -345,7 +345,7 @@ async function handleOwnerCommand(sms) {
   // Customer profile shorthand — "customer [name/id/phone]"
   if (lower.startsWith('customer ') && !lower.startsWith('customer pipeline') && !lower.startsWith('customer followups') && !lower.startsWith('customer follow-ups') && !lower.startsWith('customer leads')) {
     const target = text.substring(9).trim();
-    const cust = customerModule.findCustomer(target);
+    const cust = await customerModule.findCustomer(target);
     if (!cust) {
       reply(`No customer found matching "${target}".`);
     } else {
@@ -1249,14 +1249,14 @@ Return ONLY JSON.`;
     }
 
     case 'list_customers': {
-      await reply(customerModule.formatCustomerPipelineReport());
+      await reply(await customerModule.formatCustomerPipelineReport());
       break;
     }
 
     case 'show_customer_profile': {
       const target = cmd.target;
       if (!target) { await reply("Which customer? Say 'customer [name/id/phone]'"); break; }
-      const cust = customerModule.findCustomer(target);
+      const cust = await customerModule.findCustomer(target);
       if (!cust) {
         await reply(`Customer "${target}" not found.`);
       } else {
@@ -1266,12 +1266,12 @@ Return ONLY JSON.`;
     }
 
     case 'list_customer_followups': {
-      await reply(customerModule.formatCustomerFollowupList());
+      await reply(await customerModule.formatCustomerFollowupList());
       break;
     }
 
     case 'list_hot_leads': {
-      const custs = customerModule.loadCustomers().filter(c => c.lead_score === 'HOT');
+      const custs = (await customerModule.loadCustomers()).filter(c => c.lead_score === 'HOT');
       if (custs.length === 0) {
         await reply('No HOT leads currently in pipeline.');
       } else {
@@ -1288,12 +1288,12 @@ Return ONLY JSON.`;
         await reply("Please specify customer and status, e.g. 'update customer John status QUALIFIED'");
         break;
       }
-      const cust = customerModule.findCustomer(target);
+      const cust = await customerModule.findCustomer(target);
       if (!cust) {
         await reply(`Customer "${target}" not found.`);
         break;
       }
-      const updated = customerModule.updateCustomer(cust.customer_id, { lead_status: newStatus });
+      const updated = await customerModule.updateCustomer(cust.customer_id, { lead_status: newStatus });
       await reply(`✅ Updated ${updated.customer_name} [${updated.customer_id}] status to ${newStatus}.`);
       log.action('owner-command', `update_customer_status: ${updated.customer_id} -> ${newStatus}`);
       break;
@@ -1302,12 +1302,12 @@ Return ONLY JSON.`;
     case 'escalate_customer': {
       const target = cmd.target;
       if (!target) { await reply("Which customer?"); break; }
-      const cust = customerModule.findCustomer(target);
+      const cust = await customerModule.findCustomer(target);
       if (!cust) {
         await reply(`Customer "${target}" not found.`);
         break;
       }
-      const updated = customerModule.updateCustomer(cust.customer_id, {
+      const updated = await customerModule.updateCustomer(cust.customer_id, {
         escalation_status: 'HUMAN_REVIEW_REQUIRED'
       });
       const handoff = customerModule.formatHandoffSummary({

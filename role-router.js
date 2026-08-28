@@ -120,9 +120,9 @@ export async function resolvePersonAndRoles({
                     (email ? await recruiter.findSubcontractor(email) : null) ||
                     (contact?.id ? await recruiter.findSubcontractor(contact.id) : null);
 
-  const custRecord = customerModule.findCustomer(phone) ||
-                     (email ? customerModule.findCustomer(email) : null) ||
-                     (contact?.id ? customerModule.findCustomer(contact.id) : null);
+  const custRecord = (await customerModule.findCustomer(phone)) ||
+                     (email ? await customerModule.findCustomer(email) : null) ||
+                     (contact?.id ? await customerModule.findCustomer(contact.id) : null);
 
   // Build non-destructive roles list
   const rolesSet = new Set();
