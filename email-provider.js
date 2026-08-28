@@ -4,6 +4,7 @@
 // structured logging, TLS validation, secure authentication
 
 import fs from 'fs';
+import path from 'path';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import { simpleParser } from 'mailparser';
@@ -314,6 +315,10 @@ class EmailProvider {
    * Handle new mail notification from IDLE
    */
   async handleNewMail() {
+    await this.drainCommsRetryQueue().catch((err) => {
+      this.logger.error('email-provider', 'Failed to drain comms retry queue in handleNewMail', { error: err.message });
+    });
+
     if (!this.onNewMailCallback) return;
 
     try {
@@ -360,6 +365,27 @@ class EmailProvider {
           // sequence number, silently marking the wrong message and leaving this one
           // "unseen" forever, so it gets reprocessed and re-replied to on every poll)
           await this.imapClient.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
+
+          // Log inbound communication (write-through)
+          const isGv = this.isGoogleVoiceText(email);
+          const channel = isGv ? 'sms' : 'email';
+          let metadata = undefined;
+          if (isGv) {
+            const gvData = this.parseGoogleVoiceEmail(email);
+            if (gvData?.sender_phone) {
+              metadata = { sender_phone: gvData.sender_phone };
+            }
+          }
+
+          await this.logCommunication({
+            channel,
+            direction: 'inbound',
+            content: email.body || '',
+            subject: email.subject,
+            from_email: email.from_email,
+            provider_message_id: email.message_id,
+            metadata
+          });
 
           // Callback to application
           await this.onNewMailCallback(email);
@@ -615,6 +641,230 @@ class EmailProvider {
   }
 
   /**
+   * HTTP request helper for Restoricon Core API
+   */
+  async coreRequest(method, urlPath, { query, body } = {}) {
+    const baseUrl = this.config?.core_api?.base_url;
+    const token = this.config?.core_api?.token;
+    if (!baseUrl || !token) {
+      throw new Error('email-provider: config.core_api.base_url/token not configured');
+    }
+    const url = new URL(urlPath, baseUrl);
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, v);
+      }
+    }
+    let response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(15000)
+      });
+    } catch (e) {
+      this.logger.error('email-provider', 'Core API request failed', { method, path: urlPath, error: e.message });
+      throw e;
+    }
+    let data = null;
+    let parseError = null;
+    try {
+      data = await response.json();
+    } catch (e) {
+      parseError = e;
+    }
+    return { status: response.status, ok: response.ok && !parseError, data, parseError };
+  }
+
+  /**
+   * Helper to locate communications retry queue file
+   */
+  getRetryFilePath() {
+    const dataDir = this.config?.paths?.data_dir || path.join(process.cwd(), 'data');
+    return path.join(dataDir, 'communications-retry.json');
+  }
+
+  /**
+   * Append communication payload to retry queue with timestamp, deduplicated on provider_message_id
+   */
+  enqueueCommsRetry(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const retryFilePath = this.getRetryFilePath();
+    const dir = path.dirname(retryFilePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    let queue = [];
+    if (fs.existsSync(retryFilePath)) {
+      try {
+        const raw = fs.readFileSync(retryFilePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          queue = parsed;
+        }
+      } catch (err) {
+        this.logger.warn('email-provider', 'Failed to read communications retry queue file, resetting', { error: err.message });
+        queue = [];
+      }
+    }
+
+    if (payload.provider_message_id) {
+      const exists = queue.some(item => item.provider_message_id === payload.provider_message_id);
+      if (exists) {
+        this.logger.debug('email-provider', 'Duplicate communication in retry queue skipped', { provider_message_id: payload.provider_message_id });
+        return false;
+      }
+    }
+
+    const item = {
+      ...payload,
+      first_attempt_at: payload.first_attempt_at || new Date().toISOString()
+    };
+    queue.push(item);
+
+    try {
+      fs.writeFileSync(retryFilePath, JSON.stringify(queue, null, 2), 'utf8');
+      this.logger.info('email-provider', 'Enqueued communication to retry queue', {
+        channel: item.channel,
+        direction: item.direction,
+        provider_message_id: item.provider_message_id,
+        queueLength: queue.length
+      });
+      return true;
+    } catch (err) {
+      this.logger.error('email-provider', 'Failed to write communications retry queue', { error: err.message });
+      return false;
+    }
+  }
+
+  /**
+   * Drain communications retry queue, attempting POST /api/v1/communications for each item
+   */
+  async drainCommsRetryQueue() {
+    const retryFilePath = this.getRetryFilePath();
+    if (!fs.existsSync(retryFilePath)) {
+      return { drained: 0, remaining: 0 };
+    }
+
+    let queue = [];
+    try {
+      const raw = fs.readFileSync(retryFilePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        queue = parsed;
+      }
+    } catch (err) {
+      this.logger.error('email-provider', 'Failed to parse communications retry queue', { error: err.message });
+      return { drained: 0, remaining: 0, error: err.message };
+    }
+
+    if (queue.length === 0) {
+      return { drained: 0, remaining: 0 };
+    }
+
+    const remaining = [];
+    let drainedCount = 0;
+
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      const { first_attempt_at, ...body } = item;
+      try {
+        const { ok, status } = await this.coreRequest('POST', '/api/v1/communications', { body });
+        if (ok || (status >= 200 && status < 300)) {
+          drainedCount++;
+          this.logger.info('email-provider', 'Successfully drained communication item', {
+            provider_message_id: item.provider_message_id,
+            status
+          });
+        } else if (status >= 400 && status < 500) {
+          // 4xx: unprocessable, drop from queue
+          drainedCount++;
+          this.logger.warn('email-provider', 'Dropping unprocessable communication item from retry queue', {
+            provider_message_id: item.provider_message_id,
+            status
+          });
+        } else {
+          // 5xx or unexpected status: stop drain immediately
+          this.logger.error('email-provider', 'Server error during communications retry drain, stopping drain', {
+            provider_message_id: item.provider_message_id,
+            status
+          });
+          remaining.push(...queue.slice(i));
+          break;
+        }
+      } catch (err) {
+        // Network or request error: stop drain immediately
+        this.logger.error('email-provider', 'Network error during communications retry drain, stopping drain', {
+          provider_message_id: item.provider_message_id,
+          error: err.message
+        });
+        remaining.push(...queue.slice(i));
+        break;
+      }
+    }
+
+    try {
+      fs.writeFileSync(retryFilePath, JSON.stringify(remaining, null, 2), 'utf8');
+    } catch (err) {
+      this.logger.error('email-provider', 'Failed to update communications retry queue file after drain', { error: err.message });
+    }
+
+    return { drained: drainedCount, remaining: remaining.length };
+  }
+
+  /**
+   * Log communication to Restoricon Core, enqueueing on retry queue on failure
+   */
+  async logCommunication({
+    channel,
+    direction,
+    content,
+    subject,
+    from_email,
+    provider_message_id,
+    metadata,
+    customer_id,
+    project_id,
+    opportunity_id
+  } = {}) {
+    const payload = {
+      channel: channel || 'email',
+      direction: direction || 'outbound',
+      content: content || '',
+      ...(subject !== undefined ? { subject } : {}),
+      ...(from_email !== undefined ? { from_email } : {}),
+      ...(provider_message_id !== undefined ? { provider_message_id } : {}),
+      ...(metadata !== undefined ? { metadata } : {}),
+      ...(customer_id !== undefined ? { customer_id } : {}),
+      ...(project_id !== undefined ? { project_id } : {}),
+      ...(opportunity_id !== undefined ? { opportunity_id } : {})
+    };
+
+    try {
+      const { ok, status } = await this.coreRequest('POST', '/api/v1/communications', { body: payload });
+      if (ok || (status >= 200 && status < 300)) {
+        return true;
+      }
+      this.logger.warn('email-provider', 'Core API communications log failed, enqueuing retry', { status, provider_message_id });
+      this.enqueueCommsRetry(payload);
+      return false;
+    } catch (err) {
+      this.logger.warn('email-provider', 'Core API communications log exception, enqueuing retry', { error: err.message, provider_message_id });
+      try {
+        this.enqueueCommsRetry(payload);
+      } catch (enqueueErr) {
+        this.logger.error('email-provider', 'Failed to enqueue communications retry', { error: enqueueErr.message });
+      }
+      return false;
+    }
+  }
+
+  /**
    * Send email reply
    */
   async sendReply(toEmail, originalSubject, body, html) {
@@ -660,6 +910,16 @@ class EmailProvider {
         subject,
         messageId: info.messageId
       });
+
+      await this.logCommunication({
+        channel: 'email',
+        direction: 'outbound',
+        content: body || (typeof html === 'string' ? html : '') || '',
+        subject,
+        from_email: toEmail,
+        provider_message_id: info?.messageId
+      });
+
       return true;
     } catch (error) {
       this.logger.error('email-provider', `Failed to send ${isReply ? 'reply' : 'email'} to ${toEmail}`, {
@@ -787,7 +1047,7 @@ class EmailProvider {
       // lines so multi-paragraph replies (e.g. the scheduling intake form)
       // actually arrive in full as a text.
       const smsText = replyText.replace(/\n{2,}/g, '\n');
-      await transporter.sendMail({
+      const info = await transporter.sendMail({
         from: this.config.gmail.email,
         to: voiceMessage.reply_to_email,
         subject: 'Re: ' + voiceMessage.original_subject,
@@ -796,6 +1056,17 @@ class EmailProvider {
       this.logger.action('email-provider', 'Google Voice reply sent', {
         to: voiceMessage.sender_name
       });
+
+      await this.logCommunication({
+        channel: 'sms',
+        direction: 'outbound',
+        content: smsText,
+        subject: 'Re: ' + (voiceMessage.original_subject || ''),
+        from_email: voiceMessage.reply_to_email,
+        provider_message_id: info?.messageId,
+        metadata: voiceMessage.sender_phone ? { sender_phone: voiceMessage.sender_phone } : undefined
+      });
+
       return true;
     } catch (error) {
       this.logger.error('email-provider', 'Failed to send Google Voice reply', {
