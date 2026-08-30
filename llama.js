@@ -11,6 +11,44 @@ const MODEL = config.llama.model;
 const MAX_TOKENS = config.llama.max_tokens;
 const TEMPERATURE = config.llama.temperature;
 
+const CORE_API_BASE_URL = config.core_api?.base_url || null;
+const CORE_API_TOKEN = config.core_api?.token || null;
+
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('llama: config.core_api.base_url/token not configured');
+  }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(180000)
+    });
+  } catch (e) {
+    return { ok: false, status: 0, data: null, parseError: e.message };
+  }
+
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e.message;
+  }
+  return { ok: response.ok, status: response.status, data, parseError };
+}
+
 // Gemini (AI Studio) is reached through Google's OpenAI-compatible
 // endpoint, so it takes the exact same {model, messages, max_tokens,
 // temperature} request shape as the local llama-server call below — only
@@ -119,6 +157,29 @@ async function chat(messages, maxTokens = MAX_TOKENS) {
 }
 
 async function chatLocal(messages, maxTokens) {
+  if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    try {
+      const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/ai/chat', {
+        body: {
+          model: MODEL,
+          messages,
+          max_tokens: maxTokens,
+          temperature: TEMPERATURE,
+          enable_thinking: false
+        }
+      });
+      if (!ok) {
+        throw new Error(`Core AI proxy returned ${status}: ${data?.error || parseError || 'Unknown error'}`);
+      }
+      const text = data?.choices?.[0]?.message?.content?.trim();
+      if (!text) throw new Error('Empty response from Core AI proxy');
+      return text;
+    } catch (e) {
+      log.error('llama', 'AI call failed (Core API proxy)', { error: e.message });
+      throw e;
+    }
+  }
+
   try {
     const response = await fetch(LLAMA_URL, {
       method: 'POST',
@@ -729,6 +790,8 @@ export {
   detectTone,
   generateContent,
   chat,
+  chatLocal,
+  coreRequest,
   getLlmProvider,
   setLlmProvider,
   classifySchedulingIntent,

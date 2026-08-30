@@ -17,6 +17,44 @@ import * as doNotContact from './do-not-contact.js';
 import * as recruiter from './subcontractor-recruiter.js';
 import * as customerModule from './customer-module.js';
 
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('owner-command: config.core_api.base_url/token not configured');
+  }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('owner-command', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
+}
+
 const PROFILE_FILE = path.join(config.paths.data_dir, 'profile.json');
 
 // Pending confirmations for destructive actions
@@ -55,7 +93,10 @@ async function reply(message) {
 async function handleRename(newName, customReply, silent = false) {
   const replyFn = customReply || reply;
   try {
-    const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    let profile = {};
+    try {
+      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    } catch (e) {}
     const oldName = profile.aigentik_name || 'Aigentik';
     const trimmed = (newName || '').trim();
     if (!trimmed) {
@@ -65,8 +106,27 @@ async function handleRename(newName, customReply, silent = false) {
     const name = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
     profile.aigentik_name = name;
     profile.agent_name_set = true;
-    fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    try {
+      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    } catch (e) {}
     config.aigentik_name = name;
+
+    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+      try {
+        await coreRequest('POST', '/api/v1/business-profile', {
+          body: {
+            ...profile,
+            aigentik_name: name,
+            agent_name_set: 1,
+            configured: profile.configured ? 1 : 0,
+            onboarding_sent: profile.onboarding_sent ? 1 : 0
+          }
+        });
+      } catch (e) {
+        log.error('owner-command', 'Failed to sync rename to Core API', { error: e.message });
+      }
+    }
+
     if (!silent) {
       await replyFn(`Done! I'll now go by "${name}" instead of "${oldName}". 😊`);
     }
@@ -141,7 +201,10 @@ function markConfiguredIfComplete(profile) {
 async function handleSetBusinessInfo(businessName, businessDescription, ownerName, customReply) {
   const replyFn = customReply || reply;
   try {
-    const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    let profile = {};
+    try {
+      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    } catch (e) {}
     const parts = [];
 
     if (ownerName && !profile.owner_name) {
@@ -162,7 +225,28 @@ async function handleSetBusinessInfo(businessName, businessDescription, ownerNam
       (profile.business_description ? `, ${profile.business_description}` : ''));
 
     markConfiguredIfComplete(profile);
-    fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    try {
+      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    } catch (e) {}
+
+    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+      try {
+        await coreRequest('POST', '/api/v1/business-profile', {
+          body: {
+            ...profile,
+            business_name: businessName,
+            business_description: profile.business_description,
+            ...(ownerName ? { owner_name: ownerName } : {}),
+            configured: 1,
+            agent_name_set: profile.agent_name_set ? 1 : 0,
+            onboarding_sent: profile.onboarding_sent ? 1 : 0
+          }
+        });
+      } catch (e) {
+        log.error('owner-command', 'Failed to sync business info to Core API', { error: e.message });
+      }
+    }
+
     await replyFn(`Got it — ${parts.join('. ')}. 😊`);
     log.action('owner-command', `Business info set: ${businessName} — ${profile.business_description || 'no description'}` +
       (ownerName ? `, owner: ${ownerName}` : ''));
@@ -180,12 +264,35 @@ async function handleSetBusinessInfo(businessName, businessDescription, ownerNam
 async function handleSetOwnerName(ownerName, customReply) {
   const replyFn = customReply || reply;
   try {
-    const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    let profile = {};
+    try {
+      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    } catch (e) {}
     const oldName = profile.owner_name;
     profile.owner_name = ownerName;
     markConfiguredIfComplete(profile);
-    fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    try {
+      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+    } catch (e) {}
     config.owner_name = ownerName;
+
+    const configured = (ownerName && config.business_name) ? 1 : 0;
+    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+      try {
+        await coreRequest('POST', '/api/v1/business-profile', {
+          body: {
+            ...profile,
+            owner_name: ownerName,
+            configured,
+            agent_name_set: profile.agent_name_set ? 1 : 0,
+            onboarding_sent: profile.onboarding_sent ? 1 : 0
+          }
+        });
+      } catch (e) {
+        log.error('owner-command', 'Failed to sync owner name to Core API', { error: e.message });
+      }
+    }
+
     await replyFn(oldName && oldName !== ownerName
       ? `Got it — I'll call you ${ownerName} instead of ${oldName}. 😊`
       : `Got it — I'll call you ${ownerName}. 😊`);
@@ -1368,4 +1475,10 @@ Return ONLY JSON.`;
   }
 }
 
-export { handleOwnerCommand };
+export {
+  handleOwnerCommand,
+  handleRename,
+  handleSetBusinessInfo,
+  handleSetOwnerName,
+  coreRequest
+};

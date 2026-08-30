@@ -8,6 +8,7 @@
 // All routing via Gmail IMAP IDLE
 
 import { execSync, spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
 
@@ -29,6 +30,44 @@ import * as doNotContact from './do-not-contact.js';
 import * as recruiter from './subcontractor-recruiter.js';
 import * as customerModule from './customer-module.js';
 import * as roleRouter from './role-router.js';
+
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('index: config.core_api.base_url/token not configured');
+  }
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('index', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
+}
 
 const PROFILE_FILE = path.join(config.paths.data_dir, 'profile.json');
 
@@ -96,32 +135,49 @@ async function checkDoNotContact({ identifier, name, text, channel }) {
 // fields left unset rather than defaulting them to this deployment's own
 // values, so a new install's onboarding email (see sendOnboardingEmail())
 // actually triggers instead of silently inheriting a stranger's name.
-function loadProfile() {
-  try {
-    if (!fs.existsSync(PROFILE_FILE)) {
-      const fresh = {
-        configured: false,
-        aigentik_name: 'Aigentik',
-        agent_name_set: false,
-        setup_date: new Date().toISOString(),
-        owner_name: null,
-        business_name: null,
-        business_description: null,
-        onboarding_sent: false
-      };
-      fs.writeFileSync(PROFILE_FILE, JSON.stringify(fresh, null, 2));
+async function loadProfile() {
+  let profile = null;
+  if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    try {
+      const res = await coreRequest('GET', '/api/v1/business-profile');
+      if (res.ok && res.data?.business_profile) {
+        profile = res.data.business_profile;
+      }
+    } catch (e) {
+      log.warn('index', 'Failed to fetch business profile from Core API, falling back to local cache', { error: e.message });
     }
-    const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-    config.aigentik_name = profile.aigentik_name || 'Aigentik';
-    config.owner_name = profile.owner_name || null;
-    config.business_name = profile.business_name || null;
-    config.business_description = profile.business_description || null;
-  } catch (e) {
-    config.aigentik_name = 'Aigentik';
-    config.owner_name = null;
-    config.business_name = null;
-    config.business_description = null;
   }
+
+  if (!profile) {
+    if (fs.existsSync(PROFILE_FILE)) {
+      try {
+        profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+      } catch (e) {}
+    }
+  }
+
+  if (!profile) {
+    profile = {
+      configured: false,
+      aigentik_name: 'Aigentik',
+      agent_name_set: false,
+      setup_date: new Date().toISOString(),
+      owner_name: null,
+      business_name: null,
+      business_description: null,
+      onboarding_sent: false
+    };
+  }
+
+  try {
+    fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+  } catch (e) {}
+
+  config.aigentik_name = profile.aigentik_name || 'Aigentik';
+  config.owner_name = profile.owner_name || null;
+  config.business_name = profile.business_name || null;
+  config.business_description = profile.business_description || null;
+  return profile;
 }
 
 function isLlamaRunning() {
@@ -1440,11 +1496,22 @@ async function handleNewEmail(email) {
 // ownerCommand's onboarding check (owner-command.js) the next time an email
 // arrives from the admin address.
 async function sendOnboardingEmail() {
-  let profile;
-  try {
-    profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-  } catch (e) {
-    return;
+  let profile = null;
+  if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    try {
+      const res = await coreRequest('GET', '/api/v1/business-profile');
+      if (res.ok && res.data?.business_profile) {
+        profile = res.data.business_profile;
+      }
+    } catch (e) {}
+  }
+
+  if (!profile) {
+    try {
+      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+    } catch (e) {
+      return;
+    }
   }
 
   const needsOwnerName = !config.owner_name;
@@ -1468,7 +1535,25 @@ async function sendOnboardingEmail() {
   );
 
   profile.onboarding_sent = true;
-  fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+  try {
+    fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+  } catch (e) {}
+
+  if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    try {
+      await coreRequest('POST', '/api/v1/business-profile', {
+        body: {
+          ...profile,
+          onboarding_sent: 1,
+          agent_name_set: profile.agent_name_set ? 1 : 0,
+          configured: profile.configured ? 1 : 0
+        }
+      });
+    } catch (e) {
+      log.error('index', 'Failed to update onboarding_sent in Core API', { error: e.message });
+    }
+  }
+
   log.action('index', 'Sent onboarding request email to admin');
 }
 
@@ -1483,7 +1568,7 @@ async function shutdown(signal) {
 async function main() {
   console.log('\n🤖 Aigentik v' + pkg.version + ' — Starting up...\n');
 
-  loadProfile();
+  await loadProfile();
 
   // Only spin up the local llama-server when it's actually the configured
   // provider — a Gemini-only setup has no local model to launch or wait on.
@@ -1540,7 +1625,16 @@ async function main() {
   console.log('\n✅ ' + aigentikName + ' v' + pkg.version + ' running. Press Ctrl+C to stop.\n');
 }
 
-main().catch(e => {
-  console.error('Fatal startup error:', e);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch(e => {
+    console.error('Fatal startup error:', e);
+    process.exit(1);
+  });
+}
+
+export {
+  loadProfile,
+  sendOnboardingEmail,
+  main,
+  coreRequest
+};
