@@ -140,10 +140,10 @@ async function handleRename(newName, customReply, silent = false) {
 // name — resolve a name down to the identifier(s) Aigentik would actually
 // use to reach them, since the do-not-contact list is keyed on identifiers,
 // not names.
-function resolveIdentifiers(target) {
+async function resolveIdentifiers(target) {
   if (!target) return [];
   if (target.includes('@') || /\d{7,}/.test(target)) return [target];
-  const contact = contacts.findContact(target) || contacts.findByRelationship(target);
+  const contact = (await contacts.findContact(target)) || (await contacts.findByRelationship(target));
   if (!contact) return [];
   return [...(contact.emails || []), ...(contact.phones || [])];
 }
@@ -151,7 +151,7 @@ function resolveIdentifiers(target) {
 async function handleBlockContact(target, reason, customReply) {
   const replyFn = customReply || reply;
   if (!target) { await replyFn('Who should I block? Give me a name, email, or phone number.'); return; }
-  const identifiers = resolveIdentifiers(target);
+  const identifiers = await resolveIdentifiers(target);
   if (identifiers.length === 0) {
     await replyFn(`I couldn't find an email or phone for "${target}". Try the exact email or phone number.`);
     return;
@@ -171,7 +171,7 @@ async function handleBlockContact(target, reason, customReply) {
 async function handleUnblockContact(target, customReply) {
   const replyFn = customReply || reply;
   if (!target) { await replyFn('Who should I unblock?'); return; }
-  const identifiers = resolveIdentifiers(target);
+  const identifiers = await resolveIdentifiers(target);
   const candidates = identifiers.length ? identifiers : [target];
   const removed = [];
   for (const id of candidates) {
@@ -334,7 +334,7 @@ async function handleOwnerCommand(sms) {
   // Sync contacts
   if (lower === 'sync contacts' || lower === 'refresh contacts' || lower === 'sync') {
     reply('🔄 Syncing contacts from your phone...');
-    const result = contactsSync.syncContacts();
+    const result = await contactsSync.syncContacts();
     reply('✅ Contacts synced!\n📱 ' + result.added + ' new contacts added\n🔄 ' + result.updated + ' updated\n👥 ' + result.total + ' total contacts');
     return;
   }
@@ -391,7 +391,7 @@ async function handleOwnerCommand(sms) {
 
   // List contacts
   if (lower === 'contacts' || lower === 'list contacts') {
-    const list = contacts.listContacts();
+    const list = await contacts.listContacts();
     reply(`📒 Contacts:\n${list}`);
     return;
   }
@@ -480,8 +480,8 @@ async function handleOwnerCommand(sms) {
     const topicIdx = Math.max(lower.indexOf(' about '), lower.indexOf(' re '));
     const topic = text.substring(topicIdx + 6).trim();
 
-    const exactMatch = contacts.findContact(target) ||
-                       contacts.findByRelationship(target);
+    const exactMatch = (await contacts.findContact(target)) ||
+                       (await contacts.findByRelationship(target));
 
     if (!exactMatch || !exactMatch.emails?.length) {
       await reply('I need an email address for "' + target + '". Say "add contact ' + target + ' email [address]"');
@@ -754,8 +754,8 @@ Return ONLY JSON.`;
       let toName = cmd.target;
 
       if (cmd.target) {
-        const contact = contacts.findContact(cmd.target) ||
-                        contacts.findByRelationship(cmd.target);
+        const contact = (await contacts.findContact(cmd.target)) ||
+                        (await contacts.findByRelationship(cmd.target));
         if (contact && contact.emails?.length) {
           toEmail = contact.emails[0];
           toName = contact.name || cmd.target;
@@ -846,13 +846,13 @@ Return ONLY JSON.`;
         reply('Tell me who and what. Example: "always reply to Mom with I am busy call you later"');
         break;
       }
-      const contact = contacts.findContact(target) || contacts.findByRelationship(target);
+      const contact = (await contacts.findContact(target)) || (await contacts.findByRelationship(target));
       if (!contact) {
         reply('I don\'t have ' + target + ' in contacts yet. Have them text you first or say "add contact ' + target + ' number [phone]"');
         break;
       }
       const behavior = cmd.rule_type || 'auto';
-      contacts.setContactInstructions(contact.id, instructions, behavior);
+      await contacts.setContactInstructions(contact.id, instructions, behavior);
       reply('✅ Got it! For ' + (contact.name || target) + ' I will now: ' + instructions);
       log.action('owner-command', 'Contact instructions set for ' + target);
       break;
@@ -860,18 +860,18 @@ Return ONLY JSON.`;
 
     case 'never_reply_to': {
       const target = cmd.target;
-      const contact = contacts.findContact(target) || contacts.findByRelationship(target);
+      const contact = (await contacts.findContact(target)) || (await contacts.findByRelationship(target));
       if (!contact) { reply('Contact "' + target + '" not found.'); break; }
-      contacts.setContactInstructions(contact.id, 'never reply', 'never');
+      await contacts.setContactInstructions(contact.id, 'never reply', 'never');
       reply('✅ Got it — I will never reply to ' + (contact.name || target) + '.');
       break;
     }
 
     case 'always_reply_to': {
       const target = cmd.target;
-      const contact = contacts.findContact(target) || contacts.findByRelationship(target);
+      const contact = (await contacts.findContact(target)) || (await contacts.findByRelationship(target));
       if (!contact) { reply('Contact "' + target + '" not found.'); break; }
-      contacts.setContactInstructions(contact.id, null, 'always');
+      await contacts.setContactInstructions(contact.id, null, 'always');
       reply('✅ Got it — I will always auto-reply to ' + (contact.name || target) + '.');
       break;
     }
@@ -880,18 +880,18 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('What\'s the contact\'s name?'); break; }
 
-      const existing = contacts.findContact(targetName);
+      const existing = await contacts.findContact(targetName);
       const field = cmd.contact_field;
       const value = cmd.contact_value;
 
       if (existing) {
-        if (field === 'phone') contacts.updateContact(existing.id, { phones: value });
-        else if (field === 'email') contacts.updateContact(existing.id, { emails: value });
-        else if (field === 'address') contacts.updateContact(existing.id, { address: value });
-        else if (field === 'relationship') contacts.updateContact(existing.id, { relationship: value });
+        if (field === 'phone') await contacts.updateContact(existing.id, { phones: value });
+        else if (field === 'email') await contacts.updateContact(existing.id, { emails: value });
+        else if (field === 'address') await contacts.updateContact(existing.id, { address: value });
+        else if (field === 'relationship') await contacts.updateContact(existing.id, { relationship: value });
         reply(`✅ Updated ${existing.name || targetName}.`);
       } else {
-        const c = contacts.createContact({
+        const c = await contacts.createContact({
           name: targetName,
           phones: field === 'phone' ? value : null,
           emails: field === 'email' ? value : null,
@@ -899,7 +899,7 @@ Return ONLY JSON.`;
           type: 'person',
           source: 'owner'
         });
-        if (field === 'address') contacts.updateContact(c.id, { address: value });
+        if (field === 'address') await contacts.updateContact(c.id, { address: value });
         reply(`✅ Added ${c.name} to contacts.`);
       }
       log.action('owner-command', `add_contact: ${targetName}`);
@@ -917,9 +917,9 @@ Return ONLY JSON.`;
         log.error('owner-command', 'Failed to extract subcontractor details', { error: e.message });
       }
 
-      let contact = contacts.findContact(targetName);
+      let contact = await contacts.findContact(targetName);
       if (!contact) {
-        contact = contacts.createContact({
+        contact = await contacts.createContact({
           name: targetName,
           phones: extracted.phone,
           emails: extracted.email,
@@ -928,7 +928,7 @@ Return ONLY JSON.`;
         });
       }
 
-      contacts.applySubcontractorDetails(contact.id, {
+      await contacts.applySubcontractorDetails(contact.id, {
         business_name: extracted.business_name || (contact.business_name ? null : targetName),
         trade: normalizeTrade(extracted.trade),
         trade_raw: extracted.trade,
@@ -970,7 +970,7 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('Which contact?'); break; }
 
-      const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
+      const contact = (await contacts.findContact(targetName)) || (await contacts.findByRelationship(targetName));
       if (!contact) {
         reply(`Contact "${targetName}" not found. Say "add contact ${targetName}" first.`);
         break;
@@ -984,22 +984,22 @@ Return ONLY JSON.`;
       }
 
       if (field === 'name') {
-        contacts.renameContact(contact.id, value);
+        await contacts.renameContact(contact.id, value);
         reply(`✅ Renamed ${contact.name || targetName} to ${value}.`);
       } else if (field === 'phone') {
-        contacts.updateContact(contact.id, { phones: value });
+        await contacts.updateContact(contact.id, { phones: value });
         reply(`✅ Added phone ${value} to ${contact.name || targetName}.`);
       } else if (field === 'email') {
-        contacts.updateContact(contact.id, { emails: value });
+        await contacts.updateContact(contact.id, { emails: value });
         reply(`✅ Added email ${value} to ${contact.name || targetName}.`);
       } else if (field === 'address') {
-        contacts.updateContact(contact.id, { address: value });
+        await contacts.updateContact(contact.id, { address: value });
         reply(`✅ Set ${contact.name || targetName}'s address to ${value}.`);
       } else if (field === 'relationship') {
-        contacts.updateContact(contact.id, { relationship: value });
+        await contacts.updateContact(contact.id, { relationship: value });
         reply(`✅ Set ${contact.name || targetName}'s relationship to ${value}.`);
       } else if (field === 'notes') {
-        contacts.updateContact(contact.id, { notes: value });
+        await contacts.updateContact(contact.id, { notes: value });
         reply(`✅ Updated notes for ${contact.name || targetName}.`);
       } else {
         reply(`I don't know how to update "${field}".`);
@@ -1013,12 +1013,12 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('Which contact should I delete?'); break; }
 
-      const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
+      const contact = (await contacts.findContact(targetName)) || (await contacts.findByRelationship(targetName));
       if (!contact) { reply(`Contact "${targetName}" not found.`); break; }
 
       pendingConfirmations.set('pending', {
         execute: async () => {
-          contacts.deleteContact(contact.id);
+          await contacts.deleteContact(contact.id);
           reply(`🗑️ Deleted ${contact.name || targetName} from contacts.`);
           log.action('owner-command', `Deleted contact: ${targetName}`);
         }
@@ -1031,10 +1031,10 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('Who\'s this appointment for?'); break; }
 
-      let contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
+      let contact = (await contacts.findContact(targetName)) || (await contacts.findByRelationship(targetName));
       if (!contact && targetName.includes('@')) {
         // A raw email address, not (yet) a saved contact — track it anyway
-        contact = contacts.findOrCreateByEmail(targetName, null);
+        contact = await contacts.findOrCreateByEmail(targetName, null);
       }
       if (!contact) {
         reply(`Contact "${targetName}" not found. Add them first with "add contact ${targetName}", or give me an email address directly.`);
@@ -1075,7 +1075,7 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('Whose appointment?'); break; }
 
-      const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
+      const contact = (await contacts.findContact(targetName)) || (await contacts.findByRelationship(targetName));
       if (!contact) { reply(`Contact "${targetName}" not found.`); break; }
 
       const appts = await calendarModule.findAppointmentsByContact(contact.id);
@@ -1104,7 +1104,7 @@ Return ONLY JSON.`;
       const targetName = cmd.target;
       if (!targetName) { reply('Whose appointment should I cancel?'); break; }
 
-      const contact = contacts.findContact(targetName) || contacts.findByRelationship(targetName);
+      const contact = (await contacts.findContact(targetName)) || (await contacts.findByRelationship(targetName));
       if (!contact) { reply(`Contact "${targetName}" not found.`); break; }
 
       const appts = await calendarModule.findAppointmentsByContact(contact.id);
@@ -1204,15 +1204,15 @@ Return ONLY JSON.`;
       const searchTerm = cmd.target;
       if (!searchTerm) { await reply('Who are you looking for?'); break; }
 
-      const exactMatch = contacts.findContact(searchTerm) ||
-                         contacts.findByRelationship(searchTerm);
+      const exactMatch = (await contacts.findContact(searchTerm)) ||
+                         (await contacts.findByRelationship(searchTerm));
 
       if (exactMatch) {
         await reply('📒 Found:\n' + contacts.formatContactInfo(exactMatch));
         break;
       }
 
-      const allMatches = contacts.findAllByName(searchTerm);
+      const allMatches = await contacts.findAllByName(searchTerm);
 
       if (allMatches.length === 0) {
         await reply('No contact found for "' + searchTerm + '".\n\nTry "sync contacts" to refresh from your phone.');
@@ -1231,19 +1231,19 @@ Return ONLY JSON.`;
 
     case 'sync_contacts': {
       await reply('🔄 Syncing contacts from your phone...');
-      const result = contactsSync.syncContacts();
+      const result = await contactsSync.syncContacts();
       await reply('✅ Done!\n📱 ' + result.added + ' new\n🔄 ' + result.updated + ' updated\n👥 ' + result.total + ' total');
       break;
     }
 
     case 'list_contacts':
-      await reply(`📒 Contacts:\n${contacts.listContacts()}`);
+      await reply(`📒 Contacts:\n${await contacts.listContacts()}`);
       break;
 
     case 'list_subcontractors_by_trade': {
       const tradeQuery = cmd.target;
       if (!tradeQuery) { await reply('Which trade?'); break; }
-      const matches = contacts.findSubcontractorsByTrade(tradeQuery);
+      const matches = await contacts.findSubcontractorsByTrade(tradeQuery);
       if (matches.length === 0) {
         await reply(`I don't have any subcontractors on file for "${tradeQuery}".`);
         break;

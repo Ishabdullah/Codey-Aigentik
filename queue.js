@@ -6,12 +6,21 @@ import path from 'path';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 
-const QUEUE_FILE = path.join(config.paths.data_dir, 'pending.json');
+let customQueueFile = null;
+
+function getQueueFile() {
+  return customQueueFile || path.join(config.paths?.data_dir || './data', 'pending.json');
+}
+
+function setQueueFilePath(newPath) {
+  customQueueFile = newPath;
+}
 
 function loadQueue() {
+  const filePath = getQueueFile();
   try {
-    if (fs.existsSync(QUEUE_FILE)) {
-      return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     }
   } catch (e) {
     log.warn('queue', 'Could not load queue file');
@@ -20,8 +29,13 @@ function loadQueue() {
 }
 
 function saveQueue(queue) {
+  const filePath = getQueueFile();
   try {
-    fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2));
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(queue, null, 2));
   } catch (e) {
     log.error('queue', 'Failed to save queue', { error: e.message });
   }
@@ -136,5 +150,7 @@ export {
   updateDraft,
   listQueue,
   formatQueueForSms,
-  formatItemForSms
+  formatItemForSms,
+  setQueueFilePath,
+  getQueueFile
 };

@@ -1,34 +1,91 @@
 // contacts.js — Aigentik contact memory system
 // Builds and maintains a growing directory of contacts
-// Gets smarter the more Aigentik is used
+//
+// Track B Phase B2 cutover: this module used to store contacts in
+// data/contacts.json. It now writes through to Restoricon Core's
+// /api/v1/contacts* routes — Core is the single source of truth,
+// Core-only, with no local-JSON fallback.
 
-import fs from 'fs';
-import path from 'path';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 import { normalizeTrade } from './trades.js';
 
-const CONTACTS_FILE = path.join(config.paths.data_dir, 'contacts.json');
+const CORE_API_BASE_URL = config.core_api?.base_url;
+const CORE_API_TOKEN = config.core_api?.token;
+const LIST_LIMIT = 1000;
 
-// Load contacts from disk
-function loadContacts() {
-  try {
-    if (fs.existsSync(CONTACTS_FILE)) {
-      return JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
-    }
-  } catch (e) {
-    log.warn('contacts', 'Could not load contacts file', { error: e.message });
+// ─── HTTP Core API Helpers ──────────────────────────────────────────────────
+
+async function coreRequest(method, urlPath, { query, body } = {}) {
+  if (!CORE_API_BASE_URL || !CORE_API_TOKEN) {
+    throw new Error('contacts: config.core_api.base_url/token not configured');
   }
-  return [];
+  const url = new URL(urlPath, CORE_API_BASE_URL);
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, v);
+    }
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CORE_API_TOKEN}`
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) {
+    log.error('contacts', 'Core API request failed', { method, path: urlPath, error: e.message });
+    throw e;
+  }
+  let data = null;
+  let parseError = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    parseError = e;
+  }
+  return { status: response.status, ok: response.ok && !parseError, data, parseError };
 }
 
-// Save contacts to disk
-function saveContacts(contacts) {
-  try {
-    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(contacts, null, 2));
-  } catch (e) {
-    log.error('contacts', 'Failed to save contacts', { error: e.message });
+// Explicit Mapping between Core API and JS model
+function mapCoreToJS(coreObj) {
+  if (!coreObj) return null;
+  const jsObj = { ...coreObj };
+  jsObj.id = coreObj.external_id || (coreObj.id ? `contact_${String(coreObj.id).padStart(4, '0')}` : null);
+  jsObj._core_id = coreObj.id;
+  jsObj.aliases = coreObj.aliases || [];
+  jsObj.phones = coreObj.phones || [];
+  jsObj.emails = coreObj.emails || [];
+  jsObj.roles = coreObj.roles || [];
+  jsObj.references = coreObj.references || [];
+  jsObj.history = coreObj.history || [];
+
+  const boolFields = ['licensed', 'gl_insurance', 'wc_insurance', 'has_tools'];
+  for (const field of boolFields) {
+    if (coreObj[field] === 1 || coreObj[field] === true) jsObj[field] = true;
+    else if (coreObj[field] === 0 || coreObj[field] === false) jsObj[field] = false;
+    else jsObj[field] = null;
   }
+  return jsObj;
+}
+
+function mapJSToCore(jsObj) {
+  if (!jsObj) return null;
+  const coreObj = { ...jsObj };
+  if (jsObj.id && typeof jsObj.id === 'string' && jsObj.id.startsWith('contact_')) {
+    coreObj.external_id = jsObj.id;
+  }
+  const boolFields = ['licensed', 'gl_insurance', 'wc_insurance', 'has_tools'];
+  for (const field of boolFields) {
+    if (jsObj[field] === true) coreObj[field] = 1;
+    else if (jsObj[field] === false) coreObj[field] = 0;
+    else if (jsObj[field] === null) coreObj[field] = null;
+  }
+  return coreObj;
 }
 
 // Normalize phone number to last 10 digits for comparison
@@ -43,43 +100,59 @@ function normalizeEmail(email) {
   return email.toLowerCase().trim();
 }
 
-// Generate a unique contact ID
-function generateId(contacts) {
-  const maxId = contacts.reduce((max, c) => {
-    const num = parseInt((c.id || '').replace('contact_', ''), 10) || 0;
-    return num > max ? num : max;
-  }, 0);
-  return `contact_${String(maxId + 1).padStart(4, '0')}`;
-}
-
-// Find a contact by ID, phone, email, or name
-function findContact(identifier) {
-  const contacts = loadContacts();
+// Find a contact by ID, phone, email, or name via Core API
+async function findContact(identifier) {
   if (!identifier) return null;
-
-  const directMatch = contacts.find(c => c.id === identifier);
-  if (directMatch) return directMatch;
-
-  const normPhone = normalizePhone(identifier);
-  const normEmail = normalizeEmail(identifier);
-  const nameLower = identifier.toLowerCase().trim();
-
-  return contacts.find(c => {
-    if (c.id === identifier) return true;
-    if (normPhone && c.phones?.some(p => normalizePhone(p) === normPhone)) return true;
-    if (normEmail && c.emails?.some(e => normalizeEmail(e) === normEmail)) return true;
-    if (c.name?.toLowerCase() === nameLower) return true;
-    if (c.name?.toLowerCase().includes(nameLower)) return true;
-    if (c.aliases?.some(a => a.toLowerCase() === nameLower)) return true;
-    if (c.aliases?.some(a => a.toLowerCase().includes(nameLower))) return true;
-    return false;
-  }) || null;
+  try {
+    const res = await coreRequest('GET', '/api/v1/contacts/find', {
+      query: { q: identifier }
+    });
+    if (res.status === 404 || !res.data?.contact) return null;
+    if (!res.ok) {
+      log.error('contacts', 'findContact error', { identifier, status: res.status });
+      return null;
+    }
+    return mapCoreToJS(res.data.contact);
+  } catch (e) {
+    log.error('contacts', 'findContact failed', { identifier, error: e.message });
+    return null;
+  }
 }
 
 // Find a contact by its exact id
-function getContactById(id) {
+async function getContactById(id) {
   if (!id) return null;
-  return loadContacts().find(c => c.id === id) || null;
+  try {
+    const res = await coreRequest('GET', `/api/v1/contacts/${encodeURIComponent(id)}`);
+    if (res.status === 404 || !res.data?.contact) return null;
+    if (!res.ok) {
+      log.error('contacts', 'getContactById error', { id, status: res.status });
+      return null;
+    }
+    return mapCoreToJS(res.data.contact);
+  } catch (e) {
+    log.error('contacts', 'getContactById failed', { id, error: e.message });
+    return null;
+  }
+}
+
+// Load contacts from Core API
+async function loadContacts() {
+  try {
+    const res = await coreRequest('GET', '/api/v1/contacts', {
+      query: { limit: LIST_LIMIT }
+    });
+    if (!res.ok || !res.data?.contacts) return [];
+    return res.data.contacts.map(mapCoreToJS);
+  } catch (e) {
+    log.warn('contacts', 'Could not load contacts from Core API', { error: e.message });
+    return [];
+  }
+}
+
+// Save contacts (no-op warning under write-through)
+function saveContacts(contacts) {
+  log.warn('contacts', 'saveContacts called under write-through architecture — operations persist directly to Core API');
 }
 
 // Which of `required` (any of 'name','email','phone','address') this
@@ -95,34 +168,27 @@ function getMissingFields(contact, required) {
   });
 }
 
-// Apply LLM-extracted { name, email, phone, address } onto a contact,
-// filling in only what's actually present — used while collecting missing
-// info before booking an appointment
-function applyExtractedDetails(id, extracted) {
+// Apply LLM-extracted { name, email, phone, address } onto a contact
+async function applyExtractedDetails(id, extracted) {
   const updates = {};
   if (extracted?.name) updates.name = extracted.name;
   if (extracted?.email) updates.emails = extracted.email;
   if (extracted?.phone) updates.phones = extracted.phone;
   if (extracted?.address) updates.address = extracted.address;
   if (Object.keys(updates).length === 0) return null;
-  return updateContact(id, updates);
+  return await updateContact(id, updates);
 }
 
-// Apply a parsed subcontractor application (subcontractor-form.js) onto a
-// contact — always forces type to 'subcontractor' (a submitted application
-// is an unambiguous signal, unlike the incremental scheduling-intake
-// extraction applyExtractedDetails does) and overwrites trade/license/
-// insurance/crew fields with the latest submission rather than merging,
-// since a resubmission should reflect current standing, not accumulate.
-function applySubcontractorDetails(id, parsed) {
+// Apply a parsed subcontractor application onto a contact
+async function applySubcontractorDetails(id, parsed) {
   if (!parsed) return null;
   const updates = { type: 'subcontractor' };
   if (parsed.business_name) updates.business_name = parsed.business_name;
   if (parsed.trade) updates.trade = parsed.trade;
   if (parsed.trade_raw) updates.trade_raw = parsed.trade_raw;
   if (parsed.principal_name) updates.name = parsed.principal_name;
-  if (parsed.phone) updates.phones = parsed.phone;
-  if (parsed.email) updates.emails = parsed.email;
+  if (parsed.phone) updates.phones = [parsed.phone].flat();
+  if (parsed.email) updates.emails = [parsed.email].flat();
   if (parsed.licensed !== null && parsed.licensed !== undefined) updates.licensed = parsed.licensed;
   if (parsed.license_number) updates.license_number = parsed.license_number;
   if (parsed.gl_insurance !== null && parsed.gl_insurance !== undefined) updates.gl_insurance = parsed.gl_insurance;
@@ -131,19 +197,16 @@ function applySubcontractorDetails(id, parsed) {
   if (parsed.crew_size != null) updates.crew_size = parsed.crew_size;
   if (parsed.weekly_capacity) updates.weekly_capacity = parsed.weekly_capacity;
   if (parsed.references?.length) updates.references = parsed.references;
-  return updateContact(id, updates);
+  return await updateContact(id, updates);
 }
 
-// Subcontractors on file whose trade matches a freeform query (e.g. "list
-// my plumbers" -> tradeQuery "plumbers") — normalizes the query the same
-// way trade_raw was normalized on intake so "plumber"/"plumbing"/"Plumbing
-// Contractor" all resolve to the same slug; falls back to a raw substring
-// match against trade_raw for a trade that didn't map to a known slug.
-function findSubcontractorsByTrade(tradeQuery) {
+// Subcontractors on file whose trade matches a freeform query
+async function findSubcontractorsByTrade(tradeQuery) {
   if (!tradeQuery) return [];
   const norm = normalizeTrade(tradeQuery);
   const q = tradeQuery.toLowerCase().trim();
-  return loadContacts().filter(c => {
+  const allContacts = await loadContacts();
+  return allContacts.filter(c => {
     if (c.type !== 'subcontractor') return false;
     if (norm && c.trade === norm) return true;
     if (c.trade_raw && c.trade_raw.toLowerCase().includes(q)) return true;
@@ -151,10 +214,7 @@ function findSubcontractorsByTrade(tradeQuery) {
   });
 }
 
-// Trade/license/insurance/crew block appended to a subcontractor's contact
-// info — shared by formatContactInfo (owner "find [name]") and anywhere
-// else (e.g. index.js's appointment detail block) that needs to hand the
-// admin a subcontractor's standing alongside their booking/contact info.
+// Trade/license/insurance/crew block appended to a subcontractor's contact info
 function formatSubcontractorDetails(contact) {
   if (!contact || contact.type !== 'subcontractor') return '';
   const lines = [];
@@ -168,29 +228,24 @@ function formatSubcontractorDetails(contact) {
   if (contact.has_tools !== null && contact.has_tools !== undefined) lines.push('🧰 Own tools/crew: ' + (contact.has_tools ? 'Yes' : 'No'));
   if (contact.crew_size != null) lines.push('👷 Crew size: ' + contact.crew_size);
   if (contact.weekly_capacity) lines.push('🗓️ Capacity: ' + contact.weekly_capacity);
-  if (contact.references?.length) lines.push('📇 References: ' + contact.references.map(r => r.raw).join('; '));
+  if (contact.references?.length) lines.push('📇 References: ' + contact.references.map(r => r.raw || r).join('; '));
   return lines.join('\n');
 }
 
-// Find contact by relationship label (e.g. "boss", "wife")
-function findByRelationship(relationship) {
-  const contacts = loadContacts();
+// Find contact by relationship label
+async function findByRelationship(relationship) {
+  if (!relationship) return null;
+  const allContacts = await loadContacts();
   const rel = relationship.toLowerCase().trim();
-  return contacts.find(c => c.relationship?.toLowerCase() === rel) || null;
+  return allContacts.find(c => c.relationship?.toLowerCase() === rel) || null;
 }
 
 // Create a new contact
-function createContact({ name, phones, emails, relationship, type, notes, source }) {
-  const contacts = loadContacts();
-  const id = generateId(contacts);
-
-  const contact = {
-    id,
+async function createContact({ name, phones, emails, relationship, type, notes, source, ...extra }) {
+  const contactPayload = mapJSToCore({
     name: name || null,
-    aliases: [],
     phones: phones ? [phones].flat().filter(Boolean) : [],
     emails: emails ? [emails].flat().filter(Boolean) : [],
-    address: null,
     relationship: relationship || null,
     type: type || 'unknown',
     notes: notes || null,
@@ -198,149 +253,159 @@ function createContact({ name, phones, emails, relationship, type, notes, source
     reply_behavior: 'auto',
     roles: type === 'subcontractor' ? ['SUBCONTRACTOR'] : ['CUSTOMER'],
     active_role: type === 'subcontractor' ? 'SUBCONTRACTOR' : 'CUSTOMER',
-    // Subcontractor-specific fields — stay null/empty for every other
-    // contact type, populated from a parsed application (see
-    // applySubcontractorDetails / subcontractor-form.js).
-    business_name: null,
-    trade: null,
-    trade_raw: null,
-    licensed: null,
-    license_number: null,
-    gl_insurance: null,
-    wc_insurance: null,
-    has_tools: null,
-    crew_size: null,
-    weekly_capacity: null,
-    references: [],
     source: source || 'auto',
     first_seen: new Date().toISOString(),
     last_contact: new Date().toISOString(),
     contact_count: 1,
-    history: []
-  };
-  contacts.push(contact);
-  saveContacts(contacts);
+    history: [],
+    ...extra
+  });
 
-  log.info('contacts', `New contact created: ${name || phones || emails}`, { id });
-  return contact;
+  const res = await coreRequest('POST', '/api/v1/contacts', { body: contactPayload });
+  if (!res.ok || !res.data?.contact) {
+    throw new Error(`contacts: createContact failed with status ${res.status}`);
+  }
+
+  const created = mapCoreToJS(res.data.contact);
+  log.info('contacts', `New contact created: ${name || phones || emails}`, { id: created.id });
+  return created;
 }
 
 // Update an existing contact with new info
-function updateContact(id, updates) {
-  const contacts = loadContacts();
-  const idx = contacts.findIndex(c => c.id === id);
-  if (idx === -1) {
+async function updateContact(id, updates) {
+  if (!id) return null;
+  const existing = await getContactById(id);
+  if (!existing) {
     log.warn('contacts', `Contact not found for update: ${id}`);
     return null;
   }
 
-  const contact = contacts[idx];
+  const coreUpdates = {};
 
   if (updates.phones) {
+    const existingPhones = existing.phones || [];
     const newPhones = [updates.phones].flat().filter(Boolean);
+    const merged = [...existingPhones];
     newPhones.forEach(p => {
-      if (!contact.phones.some(ep => normalizePhone(ep) === normalizePhone(p))) {
-        contact.phones.push(p);
+      if (!merged.some(ep => normalizePhone(ep) === normalizePhone(p))) {
+        merged.push(p);
       }
     });
+    coreUpdates.phones = merged;
   }
 
   if (updates.emails) {
+    const existingEmails = existing.emails || [];
     const newEmails = [updates.emails].flat().filter(Boolean);
+    const merged = [...existingEmails];
     newEmails.forEach(e => {
-      if (!contact.emails.some(ee => normalizeEmail(ee) === normalizeEmail(e))) {
-        contact.emails.push(e);
+      if (!merged.some(ee => normalizeEmail(ee) === normalizeEmail(e))) {
+        merged.push(e);
       }
     });
+    coreUpdates.emails = merged;
   }
 
   if (updates.aliases) {
+    const existingAliases = existing.aliases || [];
     const newAliases = [updates.aliases].flat().filter(Boolean);
+    const merged = [...existingAliases];
     newAliases.forEach(a => {
-      if (!contact.aliases.includes(a)) contact.aliases.push(a);
+      if (!merged.includes(a)) merged.push(a);
     });
+    coreUpdates.aliases = merged;
   }
 
-  if (updates.name && !contact.name) contact.name = updates.name;
-  if (updates.relationship) contact.relationship = updates.relationship;
-  if (updates.type) contact.type = updates.type;
+  if (updates.name && (!existing.name || updates.forceName)) coreUpdates.name = updates.name;
+  if (updates.relationship) coreUpdates.relationship = updates.relationship;
+  if (updates.type) coreUpdates.type = updates.type;
   if (updates.roles) {
-    const existing = new Set(contact.roles || []);
-    [updates.roles].flat().filter(Boolean).forEach(r => existing.add(r));
-    contact.roles = Array.from(existing);
+    const existingRoles = new Set(existing.roles || []);
+    [updates.roles].flat().filter(Boolean).forEach(r => existingRoles.add(r));
+    coreUpdates.roles = Array.from(existingRoles);
   }
-  if (updates.active_role) contact.active_role = updates.active_role;
-  if (updates.notes) contact.notes = updates.notes;
-  if (updates.address) contact.address = updates.address;
-  if (updates.business_name) contact.business_name = updates.business_name;
-  if (updates.trade) contact.trade = updates.trade;
-  if (updates.trade_raw) contact.trade_raw = updates.trade_raw;
-  if (updates.licensed !== undefined) contact.licensed = updates.licensed;
-  if (updates.license_number) contact.license_number = updates.license_number;
-  if (updates.gl_insurance !== undefined) contact.gl_insurance = updates.gl_insurance;
-  if (updates.wc_insurance !== undefined) contact.wc_insurance = updates.wc_insurance;
-  if (updates.has_tools !== undefined) contact.has_tools = updates.has_tools;
-  if (updates.crew_size != null) contact.crew_size = updates.crew_size;
-  if (updates.weekly_capacity) contact.weekly_capacity = updates.weekly_capacity;
-  if (updates.references) contact.references = updates.references;
+  if (updates.active_role) coreUpdates.active_role = updates.active_role;
+  if (updates.notes) coreUpdates.notes = updates.notes;
+  if (updates.address) coreUpdates.address = updates.address;
+  if (updates.business_name) coreUpdates.business_name = updates.business_name;
+  if (updates.trade) coreUpdates.trade = updates.trade;
+  if (updates.trade_raw) coreUpdates.trade_raw = updates.trade_raw;
+  if (updates.licensed !== undefined) coreUpdates.licensed = updates.licensed ? 1 : 0;
+  if (updates.license_number) coreUpdates.license_number = updates.license_number;
+  if (updates.gl_insurance !== undefined) coreUpdates.gl_insurance = updates.gl_insurance ? 1 : 0;
+  if (updates.wc_insurance !== undefined) coreUpdates.wc_insurance = updates.wc_insurance ? 1 : 0;
+  if (updates.has_tools !== undefined) coreUpdates.has_tools = updates.has_tools ? 1 : 0;
+  if (updates.crew_size != null) coreUpdates.crew_size = updates.crew_size;
+  if (updates.weekly_capacity) coreUpdates.weekly_capacity = updates.weekly_capacity;
+  if (updates.references) coreUpdates.references = updates.references;
+  if (updates.instructions) coreUpdates.instructions = updates.instructions;
+  if (updates.reply_behavior) coreUpdates.reply_behavior = updates.reply_behavior;
+  if (updates.history) coreUpdates.history = updates.history;
 
-  contact.last_contact = new Date().toISOString();
-  contact.contact_count = (contact.contact_count || 0) + 1;
+  coreUpdates.last_contact = updates.last_contact || new Date().toISOString();
+  coreUpdates.contact_count = (existing.contact_count || 0) + 1;
 
-  contacts[idx] = contact;
-  saveContacts(contacts);
+  const res = await coreRequest('POST', `/api/v1/contacts/${encodeURIComponent(id)}/update`, {
+    body: coreUpdates
+  });
+  if (!res.ok || !res.data?.contact) {
+    log.error('contacts', `updateContact failed for ${id}`, { status: res.status });
+    return null;
+  }
 
+  const updated = mapCoreToJS(res.data.contact);
   log.debug('contacts', `Contact updated: ${id}`, { updates: Object.keys(updates) });
-  return contact;
+  return updated;
 }
 
 // Delete a contact entirely
-function deleteContact(identifier) {
-  const contacts = loadContacts();
-  const contact = getContactById(identifier) || findContact(identifier) || findByRelationship(identifier);
+async function deleteContact(identifier) {
+  if (!identifier) return false;
+  const contact = (await getContactById(identifier)) || (await findContact(identifier)) || (await findByRelationship(identifier));
   if (!contact) return false;
-  saveContacts(contacts.filter(c => c.id !== contact.id));
+
+  const res = await coreRequest('POST', `/api/v1/contacts/${encodeURIComponent(contact.id)}/delete`);
+  if (!res.ok) {
+    log.error('contacts', `deleteContact failed for ${identifier}`, { status: res.status });
+    return false;
+  }
   log.info('contacts', `Contact deleted: ${contact.name || contact.id}`, { id: contact.id });
   return true;
 }
 
-// Explicitly overwrite a contact's name (updateContact only fills in a missing name)
-function renameContact(identifier, newName) {
-  const contacts = loadContacts();
-  const contact = getContactById(identifier) || findContact(identifier) || findByRelationship(identifier);
+// Explicitly overwrite a contact's name
+async function renameContact(identifier, newName) {
+  const contact = (await getContactById(identifier)) || (await findContact(identifier)) || (await findByRelationship(identifier));
   if (!contact) return null;
-  const idx = contacts.findIndex(c => c.id === contact.id);
-  contacts[idx].name = newName;
-  saveContacts(contacts);
+
+  const res = await coreRequest('POST', `/api/v1/contacts/${encodeURIComponent(contact.id)}/update`, {
+    body: { name: newName }
+  });
+  if (!res.ok || !res.data?.contact) return null;
   log.info('contacts', `Contact renamed to ${newName}`, { id: contact.id });
-  return contacts[idx];
+  return mapCoreToJS(res.data.contact);
 }
 
 // Add a history entry to a contact
-function addHistory(identifier, historyEntry) {
-  const contact = getContactById(identifier) || findContact(identifier);
+async function addHistory(identifier, historyEntry) {
+  const contact = (await getContactById(identifier)) || (await findContact(identifier));
   if (!contact) return;
 
-  const contacts = loadContacts();
-  const idx = contacts.findIndex(c => c.id === contact.id);
-  if (idx === -1) return;
-
-  if (!contacts[idx].history) contacts[idx].history = [];
-  contacts[idx].history.push({
+  const history = contact.history ? [...contact.history] : [];
+  history.push({
     ...historyEntry,
     timestamp: new Date().toISOString()
   });
-  if (contacts[idx].history.length > 50) {
-    contacts[idx].history = contacts[idx].history.slice(-50);
-  }
-  contacts[idx].last_contact = new Date().toISOString();
-  contacts[idx].contact_count = (contacts[idx].contact_count || 0) + 1;
+  const slicedHistory = history.length > 50 ? history.slice(-50) : history;
 
-  saveContacts(contacts);
+  await updateContact(contact.id, {
+    history: slicedHistory,
+    last_contact: new Date().toISOString()
+  });
 }
 
 // Process extracted entities and update/create contacts automatically
-function processEntities(entities, source) {
+async function processEntities(entities, source) {
   if (!entities) return;
 
   const names = entities.names || [];
@@ -349,10 +414,11 @@ function processEntities(entities, source) {
   const businesses = entities.businesses || [];
   const relationships = entities.relationships || [];
 
-  phones.forEach((phone, i) => {
-    let contact = findContact(phone);
+  for (let i = 0; i < phones.length; i++) {
+    const phone = phones[i];
+    let contact = await findContact(phone);
     if (!contact) {
-      contact = createContact({
+      await createContact({
         name: names[i] || null,
         phones: phone,
         relationship: relationships[i] || null,
@@ -360,18 +426,19 @@ function processEntities(entities, source) {
         source
       });
     } else {
-      updateContact(contact.id, {
+      await updateContact(contact.id, {
         phones: phone,
         ...(names[i] ? { aliases: names[i] } : {}),
         ...(relationships[i] ? { relationship: relationships[i] } : {})
       });
     }
-  });
+  }
 
-  emails.forEach((email, i) => {
-    let contact = findContact(email);
+  for (let i = 0; i < emails.length; i++) {
+    const email = emails[i];
+    let contact = await findContact(email);
     if (!contact) {
-      contact = createContact({
+      await createContact({
         name: names[i] || null,
         emails: email,
         relationship: relationships[i] || null,
@@ -379,24 +446,24 @@ function processEntities(entities, source) {
         source
       });
     } else {
-      updateContact(contact.id, {
+      await updateContact(contact.id, {
         emails: email,
         ...(names[i] ? { aliases: names[i] } : {}),
         ...(relationships[i] ? { relationship: relationships[i] } : {})
       });
     }
-  });
+  }
 
-  businesses.forEach(biz => {
-    let contact = findContact(biz);
+  for (const biz of businesses) {
+    let contact = await findContact(biz);
     if (!contact) {
-      createContact({
+      await createContact({
         name: biz,
         type: 'business',
         source
       });
     }
-  });
+  }
 }
 
 // Get a formatted contact summary for display
@@ -416,17 +483,17 @@ function formatContact(contact) {
 }
 
 // List all contacts as a summary
-function listContacts() {
-  const contacts = loadContacts();
-  if (contacts.length === 0) return 'No contacts saved yet.';
-  return contacts.map(c => formatContact(c)).join('\n');
+async function listContacts() {
+  const allContacts = await loadContacts();
+  if (allContacts.length === 0) return 'No contacts saved yet.';
+  return allContacts.map(c => formatContact(c)).join('\n');
 }
 
-// Find or create contact by phone (used on every SMS)
-function findOrCreateByPhone(phone, additionalInfo = {}) {
-  let contact = findContact(phone);
+// Find or create contact by phone
+async function findOrCreateByPhone(phone, additionalInfo = {}) {
+  let contact = await findContact(phone);
   if (!contact) {
-    contact = createContact({
+    contact = await createContact({
       phones: phone,
       type: additionalInfo.type || 'unknown',
       name: additionalInfo.name || null,
@@ -437,11 +504,11 @@ function findOrCreateByPhone(phone, additionalInfo = {}) {
   return contact;
 }
 
-// Find or create contact by email (used on every email)
-function findOrCreateByEmail(email, name, additionalInfo = {}) {
-  let contact = findContact(email);
+// Find or create contact by email
+async function findOrCreateByEmail(email, name, additionalInfo = {}) {
+  let contact = await findContact(email);
   if (!contact) {
-    contact = createContact({
+    contact = await createContact({
       emails: email,
       name: name || null,
       type: 'person',
@@ -449,30 +516,30 @@ function findOrCreateByEmail(email, name, additionalInfo = {}) {
       source: 'email'
     });
   } else if (name && !contact.name) {
-    updateContact(contact.id, { name });
+    contact = await updateContact(contact.id, { name });
   }
   return contact;
 }
 
 // Set instructions for how to handle a specific contact
-function setContactInstructions(identifier, instructions, behavior) {
-  const contact = getContactById(identifier) || findContact(identifier) || findByRelationship(identifier);
+async function setContactInstructions(identifier, instructions, behavior) {
+  const contact = (await getContactById(identifier)) || (await findContact(identifier)) || (await findByRelationship(identifier));
   if (!contact) return null;
-  const contacts = loadContacts();
-  const idx = contacts.findIndex(c => c.id === contact.id);
-  if (idx === -1) return null;
-  if (instructions) contacts[idx].instructions = instructions;
-  if (behavior) contacts[idx].reply_behavior = behavior;
-  saveContacts(contacts);
+
+  const updates = {};
+  if (instructions) updates.instructions = instructions;
+  if (behavior) updates.reply_behavior = behavior;
+
+  const res = await updateContact(contact.id, updates);
   log.info('contacts', 'Contact instructions updated', { id: contact.id, instructions, behavior });
-  return contacts[idx];
+  return res;
 }
 
 // Find ALL contacts matching a name — for disambiguation
-function findAllByName(name) {
-  const contacts = loadContacts();
+async function findAllByName(name) {
+  const allContacts = await loadContacts();
   const nameLower = name.toLowerCase().trim();
-  return contacts.filter(c =>
+  return allContacts.filter(c =>
     c.name?.toLowerCase().includes(nameLower) ||
     c.aliases?.some(a => a.toLowerCase().includes(nameLower))
   );
@@ -516,5 +583,9 @@ export {
   loadContacts,
   saveContacts,
   normalizePhone,
-  setContactInstructions
+  normalizeEmail,
+  setContactInstructions,
+  coreRequest,
+  mapCoreToJS,
+  mapJSToCore
 };

@@ -1,22 +1,25 @@
 // contacts-sync.js — Aigentik Android contacts sync
 // Pulls real phone contacts via termux-contact-list
-// Merges into Aigentik contacts.json without overwriting existing data
+// Merges into Restoricon Core contacts via Core API /api/v1/contacts/sync
+//
+// Track B Phase B2 cutover: write-through directly to Core API.
 
 import { execSync } from 'child_process';
+import config from './config.json' with { type: 'json' };
 import log from './logger.js';
-import { loadContacts, saveContacts, normalizePhone } from './contacts.js';
+import { normalizePhone, coreRequest } from './contacts.js';
 
-function generateId(contacts) {
-  let max = 0;
-  for (const c of contacts) {
-    const num = parseInt((c.id || '').replace('contact_', '') || '0', 10);
-    if (num > max) max = num;
-  }
-  return 'contact_' + String(max + 1).padStart(4, '0');
+let customFetchAndroidContacts = null;
+
+function setFetchAndroidContactsForTest(fn) {
+  customFetchAndroidContacts = fn;
 }
 
 // Fetch all Android contacts via termux-api
 function fetchAndroidContacts() {
+  if (customFetchAndroidContacts) {
+    return customFetchAndroidContacts();
+  }
   try {
     const raw = execSync('termux-contact-list', {
       timeout: 15000,
@@ -30,101 +33,50 @@ function fetchAndroidContacts() {
   }
 }
 
-// Main sync function
-function syncContacts() {
+// Main sync function — calls Core API /api/v1/contacts/sync
+async function syncContacts() {
   log.info('contacts-sync', 'Syncing Android contacts...');
 
-  const aigentikContacts = loadContacts();
   const androidContacts = fetchAndroidContacts();
-  if (androidContacts.length === 0) {
+  if (!androidContacts || androidContacts.length === 0) {
     log.warn('contacts-sync', 'No Android contacts found');
-    return { android: 0, added: 0, updated: 0, total: aigentikContacts.length };
+    return { android: 0, added: 0, updated: 0, total: 0 };
   }
 
-  let added = 0;
-  let updated = 0;
+  const payload = androidContacts.map(ac => ({
+    name: ac.name,
+    phones: [ac.number],
+    aliases: [ac.name.toLowerCase()],
+    source: 'android_contacts'
+  }));
 
-  for (const ac of androidContacts) {
-    const normPhone = normalizePhone(ac.number);
-    if (!normPhone) continue;
+  try {
+    const res = await coreRequest('POST', '/api/v1/contacts/sync', {
+      body: { contacts: payload }
+    });
 
-    const existingIdx = aigentikContacts.findIndex(c =>
-      c.phones?.some(p => normalizePhone(p) === normPhone)
-    );
-
-    if (existingIdx === -1) {
-      aigentikContacts.push({
-        id: generateId(aigentikContacts),
-        name: ac.name,
-        aliases: [ac.name.toLowerCase()],
-        phones: [ac.number],
-        emails: [],
-        address: null,
-        relationship: null,
-        type: 'person',
-        notes: null,
-        instructions: null,
-        reply_behavior: 'auto',
-        business_name: null,
-        trade: null,
-        trade_raw: null,
-        licensed: null,
-        license_number: null,
-        gl_insurance: null,
-        wc_insurance: null,
-        has_tools: null,
-        crew_size: null,
-        weekly_capacity: null,
-        references: [],
-        source: 'android_contacts',
-        first_seen: new Date().toISOString(),
-        last_contact: null,
-        contact_count: 0,
-        history: []
-      });
-      added++;
-    } else {
-      const existing = aigentikContacts[existingIdx];
-
-      if (!existing.name) {
-        aigentikContacts[existingIdx].name = ac.name;
-        updated++;
-      }
-
-      const nameLower = ac.name.toLowerCase();
-      if (!existing.aliases?.includes(nameLower)) {
-        if (!aigentikContacts[existingIdx].aliases) {
-          aigentikContacts[existingIdx].aliases = [];
-        }
-        aigentikContacts[existingIdx].aliases.push(nameLower);
-        updated++;
-      }
-
-      if (existing.source === 'auto' || existing.source === 'sms') {
-        aigentikContacts[existingIdx].source = 'android_contacts';
-      }
+    if (!res.ok || !res.data?.stats) {
+      log.error('contacts-sync', 'Sync request failed', { status: res.status });
+      return { android: androidContacts.length, added: 0, updated: 0, total: 0 };
     }
+
+    const stats = res.data.stats;
+    log.info('contacts-sync', 'Sync complete', stats);
+    return stats;
+  } catch (e) {
+    log.error('contacts-sync', 'Failed to sync with Core API', { error: e.message });
+    return { android: androidContacts.length, added: 0, updated: 0, total: 0 };
   }
-
-  saveContacts(aigentikContacts);
-  log.info('contacts-sync', 'Sync complete', {
-    android: androidContacts.length,
-    added,
-    updated,
-    total: aigentikContacts.length
-  });
-
-  return { android: androidContacts.length, added, updated, total: aigentikContacts.length };
 }
 
 // Run once on startup only — no auto-interval
 // Owner can trigger manual sync by texting "sync contacts"
-function startAutoSync() {
-  const result = syncContacts();
+async function startAutoSync() {
+  const result = await syncContacts();
   if (result) {
-    log.info('contacts-sync', 'Initial sync: ' + result.added + ' new, ' + result.updated + ' updated, ' + result.total + ' total contacts');
+    log.info('contacts-sync', `Initial sync: ${result.added} new, ${result.updated} updated, ${result.total} total contacts`);
   }
   return result;
 }
 
-export { syncContacts, startAutoSync };
+export { syncContacts, startAutoSync, fetchAndroidContacts, setFetchAndroidContactsForTest };

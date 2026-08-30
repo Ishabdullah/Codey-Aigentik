@@ -288,8 +288,13 @@ function inviteSentNote() {
 // pulls them together so the admin gets full customer info on every booking
 // notification and invite, not just the name. Used for fresh bookings and
 // reschedules alike, since the admin needs the same details either way.
-function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
-  const bookedContact = appt.contact_id ? contacts.getContactById(appt.contact_id) : null;
+// Name/phone/address live on the linked contact record (collected during
+// intake via applyExtractedDetails), not on the appointment itself — this
+// pulls them together so the admin gets full customer info on every booking
+// notification and invite, not just the name. Used for fresh bookings and
+// reschedules alike, since the admin needs the same details either way.
+async function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
+  const bookedContact = appt.contact_id ? await contacts.getContactById(appt.contact_id) : null;
   const name = appt.attendee_name || bookedContact?.name || fallbackLabel;
   const phone = bookedContact?.phones?.[0] || 'not on file';
   const email = attendeeEmail || bookedContact?.emails?.[0] || appt.attendee_email || 'not on file';
@@ -309,7 +314,7 @@ function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
 async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, senderLabel, reply }) {
   const typeLabel = negotiation.appointment_type === 'in_person' ? 'in-person appointment' : 'phone call';
   const appt = await calendarModule.confirmNegotiation(negotiation.id, slot.start, slot.end, attendeeEmail);
-  const details = customerDetailBlock(appt, senderLabel, attendeeEmail);
+  const details = await customerDetailBlock(appt, senderLabel, attendeeEmail);
   if (attendeeEmail) await gmail.sendCalendarInvite(appt, attendeeEmail);
   await gmail.sendCalendarInvite(appt, adminEmail,
     `📅 New appointment booked: ${appt.title} at ${new Date(appt.start).toLocaleString()}.\n\n${details}`);
@@ -345,8 +350,8 @@ async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }
   } catch (e) {
     log.error('index', 'Failed to extract contact details from initial message', { error: e.message });
   }
-  if (contact?.id) contacts.applyExtractedDetails(contact.id, extracted);
-  const freshContact = contact?.id ? contacts.getContactById(contact.id) : contact;
+  if (contact?.id) await contacts.applyExtractedDetails(contact.id, extracted);
+  const freshContact = contact?.id ? await contacts.getContactById(contact.id) : contact;
   
   const requiredNow = detectedType ? requiredFieldsForType(detectedType) : ['name', 'email', 'phone'];
   const missing = contacts.getMissingFields(freshContact, requiredNow);
@@ -412,10 +417,10 @@ async function processIntakeReply({ negotiation, text, contact, channel, target,
   } catch (e) {
     log.error('index', 'Failed to extract intake reply', { error: e.message });
   }
-  if (contact?.id) contacts.applyExtractedDetails(contact.id, extracted);
+  if (contact?.id) await contacts.applyExtractedDetails(contact.id, extracted);
   if (extracted?.concerns) await calendarModule.setAppointmentNotes(negotiation.id, extracted.concerns);
 
-  const freshContact = contact?.id ? contacts.getContactById(contact.id) : contact;
+  const freshContact = contact?.id ? await contacts.getContactById(contact.id) : contact;
   const required = requiredFieldsForType(negotiation.appointment_type);
   const missing = contacts.getMissingFields(freshContact, required);
   const stillNeedsType = !negotiation.appointment_type;
@@ -624,7 +629,7 @@ async function handleRescheduleRequest({ classified, contact, reply, adminEmail,
 
   if (slot.start.getTime() === preferredDate.getTime()) {
     const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
-    const details = customerDetailBlock(updated, contact?.name || senderLabel, updated.attendee_email);
+    const details = await customerDetailBlock(updated, contact?.name || senderLabel, updated.attendee_email);
     if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
     await gmail.sendCalendarInvite(updated, adminEmail,
       `🔁 Appointment rescheduled: ${updated.title} now at ${new Date(updated.start).toLocaleString()}.\n\n${details}`);
@@ -668,7 +673,7 @@ async function handleRescheduleReply({ appt, text, reply, adminEmail, senderLabe
   if (slot.start.getTime() === requestedDate.getTime()) {
     const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
     await calendarModule.clearPendingReschedule(updated.id);
-    const details = customerDetailBlock(updated, senderLabel, updated.attendee_email);
+    const details = await customerDetailBlock(updated, senderLabel, updated.attendee_email);
     if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
     await gmail.sendCalendarInvite(updated, adminEmail,
       `🔁 Appointment rescheduled: ${updated.title} now at ${new Date(updated.start).toLocaleString()}.\n\n${details}`);
@@ -814,9 +819,9 @@ async function handleSubcontractorApplication(email) {
   }
 
   const parsed = subcontractorForm.parseApplication(email.body || '');
-  const contact = contacts.findOrCreateByEmail(email.from_email, parsed.principal_name || email.from_name);
-  contacts.applySubcontractorDetails(contact.id, parsed);
-  contacts.addHistory(email.from_email, {
+  const contact = await contacts.findOrCreateByEmail(email.from_email, parsed.principal_name || email.from_name);
+  if (contact?.id) await contacts.applySubcontractorDetails(contact.id, parsed);
+  await contacts.addHistory(email.from_email, {
     type: 'subcontractor_application',
     trade: parsed.trade_raw || parsed.trade,
     business_name: parsed.business_name
@@ -904,11 +909,11 @@ async function handleGoogleVoiceText(email) {
   }
 
   // Public message handling
-  const contact = contacts.findOrCreateByPhone(voiceMsg.sender_phone);
+  const contact = await contacts.findOrCreateByPhone(voiceMsg.sender_phone);
   if (voiceMsg.sender_name && contact && !contact.name) {
-    contacts.updateContact(contact.id, { name: voiceMsg.sender_name });
+    await contacts.updateContact(contact.id, { name: voiceMsg.sender_name });
   }
-  contacts.addHistory(voiceMsg.sender_phone, {
+  await contacts.addHistory(voiceMsg.sender_phone, {
     type: 'gvoice_text_received',
     preview: voiceMsg.body.substring(0, 100)
   });
@@ -1134,7 +1139,7 @@ async function handleGoogleVoiceText(email) {
 
     if (shouldAutoReply) {
       await gmail.replyToGoogleVoiceText(voiceMsg, reply);
-      contacts.addHistory(voiceMsg.sender_phone, { type: 'gvoice_auto_replied' });
+      await contacts.addHistory(voiceMsg.sender_phone, { type: 'gvoice_auto_replied' });
       await gmail.sendOwnerNotification(
         '💬 Replied to ' + (voiceMsg.sender_name || voiceMsg.sender_phone) + ':\n' +
         'They said: "' + voiceMsg.body.substring(0, 60) + '"\n' +
@@ -1234,8 +1239,8 @@ async function handleNewEmail(email) {
 
   log.info('index', 'Regular email from ' + email.from_email, { subject: email.subject });
 
-  const contact = contacts.findOrCreateByEmail(email.from_email, email.from_name);
-  contacts.addHistory(email.from_email, {
+  const contact = await contacts.findOrCreateByEmail(email.from_email, email.from_name);
+  await contacts.addHistory(email.from_email, {
     type: 'email_received',
     subject: email.subject,
     preview: email.body?.substring(0, 100)
@@ -1459,7 +1464,7 @@ async function handleNewEmail(email) {
 
     if (shouldAutoReply) {
       await gmail.sendReply(email.from_email, email.subject, reply.text, reply.html);
-      contacts.addHistory(email.from_email, { type: 'email_auto_replied' });
+      await contacts.addHistory(email.from_email, { type: 'email_auto_replied' });
       await gmail.sendOwnerNotification(
         '✉️ Auto-replied to ' + (email.from_name || email.from_email) + ':\n' +
         'Subject: ' + email.subject?.substring(0, 50) + '\n' +
@@ -1592,7 +1597,7 @@ async function main() {
 
   // Sync Android contacts
   log.info('index', 'Syncing Android contacts...');
-  contactsSync.startAutoSync();
+  await contactsSync.startAutoSync();
   log.info('index', 'Contact sync complete');
 
   // Connect to Gmail — this is the ONLY channel now

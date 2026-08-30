@@ -111,9 +111,9 @@ export async function resolvePersonAndRoles({
   name
 }) {
   // Look up contact in memory
-  const contact = contacts.findContact(phone) ||
-                  (email ? contacts.findContact(email) : null) ||
-                  (name ? contacts.findContact(name) : null);
+  const contact = (phone ? await contacts.findContact(phone) : null) ||
+                  (email ? await contacts.findContact(email) : null) ||
+                  (name ? await contacts.findContact(name) : null);
 
   // Look up CRM entities
   const subRecord = (await recruiter.findSubcontractor(phone)) ||
@@ -449,7 +449,7 @@ export function updatePersonRolesAndState({
     contacts.updateContact(id, {
       roles: updatedRoles,
       active_role: activeRole
-    });
+    }).catch(e => log.error('role-router', 'Failed to update contact roles', { error: e.message }));
   }
 
   logTransition('STATE_UPDATED', person, {

@@ -327,7 +327,7 @@ async function createOrUpdateSubcontractorLead(data) {
   }
 
   const finalRecord = resData?.subcontractor ? mapCoreToJS(resData.subcontractor) : mapCoreToJS(resData) || record;
-  syncWithContacts(finalRecord);
+  await syncWithContacts(finalRecord);
   log.info('subcontractor-recruiter', `Upserted subcontractor lead: ${finalRecord.company_name || finalRecord.contact_name || finalRecord.subcontractor_id}`);
   return finalRecord;
 }
@@ -368,26 +368,26 @@ async function updateSubcontractor(subcontractorId, updates) {
   }
 
   const updatedRecord = resData?.subcontractor ? mapCoreToJS(resData.subcontractor) : updates;
-  syncWithContacts(updatedRecord);
+  await syncWithContacts(updatedRecord);
   return updatedRecord;
 }
 
-function syncWithContacts(subcontractor) {
+async function syncWithContacts(subcontractor) {
   try {
-    const contactList = contacts.loadContacts();
+    const contactList = await contacts.loadContacts();
     let contact = null;
 
     if (subcontractor.contact_id) {
       contact = contactList.find(c => c.id === subcontractor.contact_id);
     }
     if (!contact && subcontractor.phone) {
-      contact = contacts.findByPhone(subcontractor.phone);
+      contact = await contacts.findContact(subcontractor.phone);
     }
     if (!contact && subcontractor.email) {
-      contact = contacts.findByEmail(subcontractor.email);
+      contact = await contacts.findContact(subcontractor.email);
     }
     if (!contact && subcontractor.contact_name) {
-      contact = contacts.findContact(subcontractor.contact_name);
+      contact = await contacts.findContact(subcontractor.contact_name);
     }
 
     const updates = {
@@ -405,12 +405,12 @@ function syncWithContacts(subcontractor) {
     };
 
     if (contact) {
-      contacts.updateContact(contact.id, updates);
+      await contacts.updateContact(contact.id, updates);
       if (!subcontractor.contact_id) {
         subcontractor.contact_id = contact.id;
       }
     } else if (subcontractor.contact_name || subcontractor.phone || subcontractor.email) {
-      const created = contacts.createContact({
+      const created = await contacts.createContact({
         name: subcontractor.contact_name,
         phones: subcontractor.phone ? [subcontractor.phone] : [],
         emails: subcontractor.email ? [subcontractor.email] : [],
@@ -419,7 +419,7 @@ function syncWithContacts(subcontractor) {
         notes: `Recruited for Restoricon 2027 network. ID: ${subcontractor.subcontractor_id}`,
         source: subcontractor.lead_source || 'recruitment'
       });
-      contacts.updateContact(created.id, updates);
+      await contacts.updateContact(created.id, updates);
       subcontractor.contact_id = created.id;
     }
   } catch (err) {
