@@ -365,7 +365,7 @@ async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }
     `📋 New scheduling inquiry from ${contact?.name || senderLabel}:\n` +
     `They said: "${text.substring(0, 200)}"\n` +
     (detectedType ? `Detected preference: ${detectedType === 'in_person' ? 'in-person visit' : 'phone call'}\n` : '') +
-    `Asked for: ${[...basics, !detectedType ? 'call vs. in-person preference' : null, 'preferred date/time'].filter(Boolean).join(', ')}`
+    `Asked for: ${[...missing, !detectedType ? 'call vs. in-person preference' : null, 'preferred date/time'].filter(Boolean).join(', ')}`
   );
   return true;
 }
@@ -1039,6 +1039,15 @@ async function handleGoogleVoiceText(email) {
       } catch (err) {
         log.warn('index', 'Failed to extract customer intake details', { error: err.message });
       }
+      
+      // Remove null/undefined/hallucinated schema string values from extracted
+      if (extracted) {
+        for (const key of Object.keys(extracted)) {
+          if (extracted[key] == null || extracted[key] === 'string|null' || extracted[key] === 'string') {
+            delete extracted[key];
+          }
+        }
+      }
 
       let currentCust = person.customer_record;
       if (!currentCust) {
@@ -1089,6 +1098,16 @@ async function handleGoogleVoiceText(email) {
             whatCustomerWants: extracted.escalation_reason || 'Speak with Restoricon manager/owner'
           });
           await gmail.sendOwnerNotification(handoff);
+        }
+
+        // Refresh customer record from DB before generating the reply so the
+        // latest just-extracted/merged fields are reflected in the prompt.
+        if (currentCust && currentCust.customer_id) {
+          try {
+            currentCust = await customerModule.findCustomer(currentCust.customer_id) || currentCust;
+          } catch (e) {
+            log.warn('index', 'Failed to refresh customer record', { error: e.message });
+          }
         }
 
         reply = await llama.generateCustomerReply({
@@ -1376,6 +1395,15 @@ async function handleNewEmail(email) {
         extracted = await llama.extractCustomerIntake(fullEmailContent, person.customer_record || {});
       } catch (err) {
         log.warn('index', 'Failed to extract customer intake from email', { error: err.message });
+      }
+      
+      // Remove null/undefined/hallucinated schema string values from extracted
+      if (extracted) {
+        for (const key of Object.keys(extracted)) {
+          if (extracted[key] == null || extracted[key] === 'string|null' || extracted[key] === 'string') {
+            delete extracted[key];
+          }
+        }
       }
 
       let currentCust = person.customer_record;

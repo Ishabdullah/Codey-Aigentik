@@ -555,6 +555,14 @@ async function extractContactDetails(text, fields) {
       log.warn('llama', 'Discarding ungrounded address extraction (likely hallucinated)', { extracted: parsed.address, source: text.slice(0, 150) });
       parsed.address = null;
     }
+    
+    // Explicitly delete keys where value is hallucinated string representing type
+    for (const key of Object.keys(parsed)) {
+      if (parsed[key] === 'string' || parsed[key] === 'string|null' || parsed[key] === 'boolean' || parsed[key] === 'number') {
+        delete parsed[key];
+      }
+    }
+    
     return parsed;
   } catch (e) {
     log.warn('llama', 'Failed to extract contact details', { error: e.message });
@@ -719,6 +727,14 @@ async function extractCustomerIntake(message, currentData = {}) {
       log.warn('llama', 'Discarding ungrounded property_address extraction (likely hallucinated)', { extracted: parsed.property_address, source: message.slice(0, 150) });
       parsed.property_address = null;
     }
+    
+    // Explicitly delete keys where value is hallucinated string representing type
+    for (const key of Object.keys(parsed)) {
+      if (parsed[key] === 'string' || parsed[key] === 'string|null' || parsed[key] === 'boolean' || parsed[key] === 'number') {
+        delete parsed[key];
+      }
+    }
+    
     return parsed;
   } catch (err) {
     log.warn('llama', 'Failed to extract customer intake JSON', { error: err.message });

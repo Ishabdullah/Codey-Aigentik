@@ -627,6 +627,13 @@ export async function getCustomerById(customerId) {
 }
 
 export async function createOrUpdateCustomer(leadData) {
+  // Sanitize LLM hallucinated schema strings
+  for (const key of Object.keys(leadData)) {
+    if (typeof leadData[key] === 'string' && (leadData[key] === 'string|null' || leadData[key] === 'string' || leadData[key] === 'null')) {
+      leadData[key] = null;
+    }
+  }
+
   const now = new Date().toISOString();
   let externalId = leadData.customer_id;
   let existing = null;
@@ -879,6 +886,8 @@ If the customer mentions active flooding, water gushing, structural collapse haz
 - Switch tone to EMERGENCY_REVIEW and state that Restoricon management is being alerted immediately.
 
 === CURRENT CUSTOMER CONTEXT ===
+- Known Phone: ${customer?.phone || "Not provided yet"}
+- Known Email: ${customer?.email || "Not provided yet"}
 - Customer Name: ${customerName}
 - Category: ${category}
 - Known Project: ${projectType}
