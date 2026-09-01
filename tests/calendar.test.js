@@ -342,6 +342,63 @@ describe('calendar (Core write-through)', () => {
       expect(fetchSpy.mock.calls[2][0].pathname).toBe('/api/v1/appointments/10/update');
     });
 
+    it('updateAppointment sends attendee_name through to the Core update body', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 8, external_id: 'appt_8', title: 'New appointment request', status: 'confirmed', attendee_name: '8609822868' }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointment: { id: 8, external_id: 'appt_8', title: 'Appointment with Jake', status: 'confirmed', attendee_name: 'Jake' }
+        }));
+
+      const updated = await calendar.updateAppointment('appt_8', { attendee_name: 'Jake', title: 'Appointment with Jake' });
+
+      expect(updated.attendee_name).toBe('Jake');
+      const sentBody = JSON.parse(fetchSpy.mock.calls[1][1].body);
+      expect(sentBody.attendee_name).toBe('Jake');
+      expect(sentBody.title).toBe('Appointment with Jake');
+    });
+
+    it('confirmNegotiation overwrites a stale phone-number attendee_name/title with the resolved contact name', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 8, external_id: 'appt_8', title: 'New appointment request', status: 'negotiating', attendee_name: null }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointment: { id: 8, external_id: 'appt_8', title: 'Appointment with Jake', status: 'confirmed', attendee_name: 'Jake' }
+        }));
+
+      const appt = await calendar.confirmNegotiation('appt_8', '2026-09-05T14:00:00.000Z', '2026-09-05T14:30:00.000Z', 'jake@example.com', 'Jake');
+
+      expect(appt.attendee_name).toBe('Jake');
+      const sentBody = JSON.parse(fetchSpy.mock.calls[1][1].body);
+      expect(sentBody.status).toBe('confirmed');
+      expect(sentBody.attendee_name).toBe('Jake');
+      expect(sentBody.title).toBe('Appointment with Jake');
+    });
+
+    it('confirmNegotiation leaves title/attendee_name untouched when no name is resolved', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 9, external_id: 'appt_9', title: 'New appointment request', status: 'negotiating', attendee_name: null }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointment: { id: 9, external_id: 'appt_9', title: 'New appointment request', status: 'confirmed', attendee_name: null }
+        }));
+
+      await calendar.confirmNegotiation('appt_9', '2026-09-05T14:00:00.000Z', '2026-09-05T14:30:00.000Z', null, null);
+
+      const sentBody = JSON.parse(fetchSpy.mock.calls[1][1].body);
+      expect(sentBody).not.toHaveProperty('attendee_name');
+      expect(sentBody).not.toHaveProperty('title');
+    });
+
     it('cancels an appointment', async () => {
       fetchSpy
         .mockResolvedValueOnce(mockResponse(200, {

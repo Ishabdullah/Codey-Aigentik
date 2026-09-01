@@ -577,6 +577,7 @@ async function updateAppointment(id, updates) {
   if (updates.pending_reschedule !== undefined) coreUpdates.pending_reschedule = updates.pending_reschedule;
   if (updates.ics_sequence !== undefined) coreUpdates.ics_sequence = updates.ics_sequence;
   if (updates.attendee_email !== undefined) coreUpdates.attendee_email = updates.attendee_email;
+  if (updates.attendee_name !== undefined) coreUpdates.attendee_name = updates.attendee_name;
   if (updates.history !== undefined) coreUpdates.history = updates.history;
 
   const { ok, status, data, parseError } = await coreRequest('POST', `/api/v1/appointments/${coreId}/update`, {
@@ -617,7 +618,7 @@ async function updateNegotiationOffers(id, offeredSlots) {
   return updateAppointment(id, { offered_slots: iso, start: iso[0]?.start, end: iso[0]?.end });
 }
 
-async function confirmNegotiation(id, start, end, attendeeEmail) {
+async function confirmNegotiation(id, start, end, attendeeEmail, attendeeName = null) {
   const updates = {
     status: 'confirmed',
     start: new Date(start).toISOString(),
@@ -625,6 +626,15 @@ async function confirmNegotiation(id, start, end, attendeeEmail) {
     offered_slots: []
   };
   if (attendeeEmail) updates.attendee_email = attendeeEmail;
+  // attendee_name / title were seeded at proposal time — for an SMS from an
+  // unknown number that was the phone-number display fallback, not a real
+  // name. Now that intake is complete, set them from the resolved contact
+  // name so the calendar invite the customer receives, and every owner
+  // summary, carry the real name.
+  if (attendeeName) {
+    updates.attendee_name = attendeeName;
+    updates.title = `Appointment with ${attendeeName}`;
+  }
   const appt = await updateAppointment(id, updates);
   if (appt) log.action('calendar', `Negotiation confirmed as appointment: ${appt.title}`, { id });
   return appt;

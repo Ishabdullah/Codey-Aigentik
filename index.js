@@ -288,7 +288,13 @@ function inviteSentNote() {
 // reschedules alike, since the admin needs the same details either way.
 async function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
   const bookedContact = appt.contact_id ? await contacts.getContactById(appt.contact_id) : null;
-  const name = appt.attendee_name || bookedContact?.name || fallbackLabel;
+  // The linked contact record is the source of truth for name/phone/address
+  // (see comment above). `appt.attendee_name` is only a snapshot taken when
+  // the appointment was first proposed — which can be before the customer's
+  // name was extracted, in which case it holds the phone-number display
+  // fallback from `senderLabel`. Read the contact first so the summary never
+  // shows a phone number where the name should be.
+  const name = bookedContact?.name || appt.attendee_name || fallbackLabel;
   const phone = bookedContact?.phones?.[0] || 'not on file';
   const email = attendeeEmail || bookedContact?.emails?.[0] || appt.attendee_email || 'not on file';
   const address = bookedContact?.address || 'not on file';
@@ -306,7 +312,14 @@ async function customerDetailBlock(appt, fallbackLabel, attendeeEmail) {
 // every path (fresh intake, time negotiation, reschedule) sounds the same.
 async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, senderLabel, reply }) {
   const typeLabel = negotiation.appointment_type === 'in_person' ? 'in-person appointment' : 'phone call';
-  const appt = await calendarModule.confirmNegotiation(negotiation.id, slot.start, slot.end, attendeeEmail);
+  // Resolve the real customer name from the linked contact record and thread
+  // it into the confirmation write, so the appointment's title/attendee_name
+  // (seeded at proposal time, before the name was known — see the
+  // proposeAppointment call site) are corrected in the same Core update.
+  const bookedContact = negotiation.contact_id ? await contacts.getContactById(negotiation.contact_id) : null;
+  const appt = await calendarModule.confirmNegotiation(
+    negotiation.id, slot.start, slot.end, attendeeEmail, bookedContact?.name || null
+  );
   const details = await customerDetailBlock(appt, senderLabel, attendeeEmail);
   if (attendeeEmail) await gmail.sendCalendarInvite(appt, attendeeEmail);
   await gmail.sendCalendarInvite(appt, adminEmail,
@@ -362,7 +375,10 @@ async function sendIntakeForm({ negotiation, text, contact, reply, senderLabel }
   await reply(form);
   await calendarModule.markFormSent(negotiation.id);
   await gmail.sendOwnerNotification(
-    `📋 New scheduling inquiry from ${contact?.name || senderLabel}:\n` +
+    // freshContact, not contact — the name extracted from this same message
+    // a few lines up is already applied, so prefer it over the phone-number
+    // senderLabel fallback.
+    `📋 New scheduling inquiry from ${freshContact?.name || senderLabel}:\n` +
     `They said: "${text.substring(0, 200)}"\n` +
     (detectedType ? `Detected preference: ${detectedType === 'in_person' ? 'in-person visit' : 'phone call'}\n` : '') +
     `Asked for: ${[...missing, !detectedType ? 'call vs. in-person preference' : null, 'preferred date/time'].filter(Boolean).join(', ')}`
@@ -776,10 +792,16 @@ async function handleSchedulingMessage({ text, contact, channel, target, subject
       log.info('index', `Skipping duplicate appointment proposal for ${senderLabel} — already has ${existingAppt.id} confirmed`);
       return false;
     }
+    // Do NOT seed the persisted title / attendee_name with `senderLabel` —
+    // for an SMS from an unknown number that's the raw phone number, and it
+    // would then surface as the customer's "name" on the calendar invite and
+    // every booking summary. The real name is extracted a moment later during
+    // intake (sendIntakeForm) and written back onto both fields in
+    // confirmAndClose; until then these stay generic / null.
     const negotiation = await calendarModule.proposeAppointment({
-      title: `Appointment with ${contact?.name || senderLabel}`,
+      title: contact?.name ? `Appointment with ${contact.name}` : 'New appointment request',
       contactId: contact?.id,
-      attendeeName: contact?.name || senderLabel,
+      attendeeName: contact?.name || null,
       attendeeEmail: channel === 'email' ? target : (contact?.emails?.[0] || null),
       createdVia: channel
     });
@@ -1669,5 +1691,6 @@ export {
   loadProfile,
   sendOnboardingEmail,
   main,
-  coreRequest
+  coreRequest,
+  customerDetailBlock
 };
