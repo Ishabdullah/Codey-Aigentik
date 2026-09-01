@@ -346,7 +346,7 @@ const EMERGENCY_KEYWORDS = [
   'collapsing', 'collapse', 'caved in', 'cave-in', 'structural damage',
   'fire', 'smoke', 'burning', 'gas smell', 'smell gas', 'gas leak', 'sparks',
   'electrical hazard', 'live wire', 'structural collapse', 'beam cracked',
-  'foundation collapsing', 'emergency', 'immediate danger', 'hazard'
+  'foundation collapsing', 'emergency', 'immediate danger', 'hazard', 'hazardous'
 ];
 
 const SWEARING_KEYWORDS = ['fuck', 'shit', 'bitch', 'asshole', 'cunt', 'bastard', 'dumbass', 'dumb fuck'];
@@ -744,22 +744,31 @@ export async function updateCustomer(customerId, fields) {
 
 // --- Intelligence: Emergency & Escalation Detection ---
 
-export function checkEmergencyKeywords(text) {
+// Match a keyword only as a whole word/phrase, not as a substring inside an
+// unrelated token. A plain `includes()` check fired on things like the
+// "manager" inside "cadre.projectmanager@gmail.com", wrongly flagging a
+// routine intake reply as an escalation and bouncing it out of the
+// scheduling flow. Keywords may contain spaces ("attorney general"); the
+// `\b` anchors still apply at the outer edges.
+function matchesKeyword(text, keywords) {
   if (!text || typeof text !== 'string') return false;
   const lower = text.toLowerCase();
-  return EMERGENCY_KEYWORDS.some(kw => lower.includes(kw));
+  return keywords.some(kw => {
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i').test(lower);
+  });
+}
+
+export function checkEmergencyKeywords(text) {
+  return matchesKeyword(text, EMERGENCY_KEYWORDS);
 }
 
 export function checkEscalationKeywords(text) {
-  if (!text || typeof text !== 'string') return false;
-  const lower = text.toLowerCase();
-  return ESCALATION_KEYWORDS.some(kw => lower.includes(kw));
+  return matchesKeyword(text, ESCALATION_KEYWORDS);
 }
 
 export function checkSwearing(text) {
-  if (!text || typeof text !== 'string') return false;
-  const lower = text.toLowerCase();
-  return SWEARING_KEYWORDS.some(kw => lower.includes(kw));
+  return matchesKeyword(text, SWEARING_KEYWORDS);
 }
 
 // --- Intelligence: Lead Scoring ---

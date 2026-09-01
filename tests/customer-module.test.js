@@ -98,6 +98,16 @@ describe('Emergency & Escalation Keyword Detection', () => {
   it('does not trigger escalation for ordinary inquiries', () => {
     expect(checkEscalationKeywords('What is the typical timeframe for a bathroom remodel?')).toBe(false);
   });
+
+  it('matches keywords on word boundaries, not as substrings of unrelated tokens', () => {
+    // "manager" inside an email address must not read as an escalation
+    expect(checkEscalationKeywords('my email is cadre.projectmanager@gmail.com and I am home Friday')).toBe(false);
+    // but a real request for a manager still does
+    expect(checkEscalationKeywords('please connect me with a manager')).toBe(true);
+    // "fire" inside "firefighters"/"fireplace" is not an active-fire emergency
+    expect(checkEmergencyKeywords('we are redoing the fireplace surround')).toBe(false);
+    expect(checkEmergencyKeywords('there is a fire in the kitchen right now')).toBe(true);
+  });
 });
 
 describe('Lead Scoring Intelligence', () => {
