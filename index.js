@@ -207,23 +207,16 @@ async function startLlamaServer() {
   try {
     // Expand tilde in model path
     const modelPath = config.llama.model_path.replace(/^~/, process.env.HOME || '/data/data/com.termux/files/home');
-    llamaProcess = spawn(config.llama.llama_server_path, [
-      '-m', modelPath,
-      '-t', String(config.llama.threads),
-      '-c', String(config.llama.context_size),
-      '--host', '0.0.0.0',
-      '--port', '8080',
-      '-np', '1',
-      '--log-disable'
-    ], { stdio: 'ignore', detached: true });
-    llamaProcess.unref();
-    llamaProcess.on('error', (e) => {
-      log.error('index', 'llama-server process error', { error: e.message });
-    });
+    log.info('index', 'Delegating llama-server load to Codey-OS daemon...');
+    try {
+      execSync("python3 -c \"import sys; sys.path.insert(0, '/data/data/com.termux/files/home/Codey-OS'); from core.loader_v2 import get_loader; get_loader().ensure_model('primary')\"", { stdio: 'ignore' });
+    } catch (e) {
+      log.error('index', 'Failed to ask Codey-OS to ensure model', { error: e.message });
+    }
     for (let i = 0; i < 30; i++) {
       await sleep(1000);
       if (isLlamaRunning()) {
-        log.info('index', 'llama-server started', { pid: llamaProcess.pid });
+        log.info('index', 'llama-server started (managed by Codey-OS)');
         return true;
       }
     }
@@ -1180,6 +1173,13 @@ async function handleNewEmail(email) {
   // Ignore emails from self
   if (email.from_email?.toLowerCase() === config.gmail.email?.toLowerCase()) {
     log.debug('index', 'Ignoring email from self');
+    return;
+  }
+
+  // Pre-process interception: Drop automated Google Drive share emails completely
+  // so they do not get treated as inbound text messages or customer inquiries.
+  if (email.from_email?.toLowerCase() === 'drive-shares-dm-noreply@google.com') {
+    log.info('index', 'Intercepted and dropped automated Google Drive notification');
     return;
   }
 

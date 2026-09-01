@@ -169,13 +169,15 @@ async function chatLocal(messages, maxTokens) {
         }
       });
       if (!ok) {
-        throw new Error(`Core AI proxy returned ${status}: ${data?.error || parseError || 'Unknown error'}`);
+        let errDetails = data?.error;
+        if (typeof errDetails === 'object') errDetails = JSON.stringify(errDetails);
+        throw new Error(`Core AI proxy returned ${status}: ${errDetails || parseError || 'Unknown error'}`);
       }
       const text = data?.choices?.[0]?.message?.content?.trim();
       if (!text) throw new Error('Empty response from Core AI proxy');
       return text;
     } catch (e) {
-      log.error('llama', 'AI call failed (Core API proxy)', { error: e.message });
+      log.error('llama', 'AI call failed (Core API proxy)', { error: e.message, fullData: e });
       throw e;
     }
   }
@@ -748,21 +750,21 @@ async function generateIntakeAsk({ text, missingFields, needsType, needsDate, ag
 
   if (asks.length === 0) return '';
 
-  let prompt = `You are ${agentName || 'an assistant'}, an AI intake assistant for ${businessName || 'the business'}. `;
+  const systemMsg = `You are ${agentName || 'an assistant'}, an AI intake assistant for ${businessName || 'the business'}.\nWrite a brief, conversational response. Do NOT sound like a robotic checklist. Ask the questions naturally in one or two sentences. Do NOT include any signatures or sign-offs (like "— Restoricon").`;
   
+  let userMsg = "";
   if (isFirstMessage) {
-    prompt += `A customer just reached out to request an estimate or appointment. Their message: "${text}".\n`;
-    prompt += `You need to greet them warmly, introduce yourself as ${agentName}, acknowledge their specific request, and then ask for the following missing information: ${asks.join(', ')}.\n`;
+    userMsg += `A customer just reached out to request an estimate or appointment. Their message: "${text}".\n`;
+    userMsg += `You need to greet them warmly, introduce yourself as ${agentName}, acknowledge their specific request, and then ask for the following missing information: ${asks.join(', ')}.\n`;
   } else {
-    prompt += `You are in the middle of scheduling an appointment with a customer. Their last message: "${text}".\n`;
-    prompt += `You have successfully gathered some information, but you still need to ask for the following missing information: ${asks.join(', ')}.\n`;
-    prompt += `Acknowledge what they just provided, and seamlessly ask for the remaining missing information.\n`;
+    userMsg += `You are in the middle of scheduling an appointment with a customer. Their last message: "${text}".\n`;
+    userMsg += `You have successfully gathered some information, but you still need to ask for the following missing information: ${asks.join(', ')}.\n`;
+    userMsg += `Acknowledge what they just provided, and seamlessly ask for the remaining missing information.\n`;
   }
-  
-  prompt += `Write a brief, conversational response. Do NOT sound like a robotic checklist. Ask the questions naturally in one or two sentences. Do NOT include any signatures or sign-offs (like "— Restoricon").`;
 
   const messages = [
-    { role: 'system', content: prompt }
+    { role: 'system', content: systemMsg },
+    { role: 'user', content: userMsg }
   ];
   try {
     const raw = await chat(messages, 250);
