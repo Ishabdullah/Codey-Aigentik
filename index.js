@@ -69,6 +69,11 @@ async function coreRequest(method, urlPath, { query, body } = {}) {
   return { status: response.status, ok: response.ok && !parseError, data, parseError };
 }
 
+// PROFILE_FILE is a write-through cache of the business profile, not the source
+// of truth. When config.core_api is set, loadProfile() reads from Core first and
+// only falls back to this file when Core is unreachable or has no profile yet;
+// the file is then rewritten from whatever was resolved. owner-command.js keeps
+// it fresh the same way after each write.
 const PROFILE_FILE = path.join(config.paths.data_dir, 'profile.json');
 
 // Strip a quoted-reply block off an admin command email, so replying to one
@@ -169,6 +174,9 @@ async function loadProfile() {
     };
   }
 
+  // Refresh the local cache with whatever we resolved (Core value if reachable,
+  // otherwise the existing local/default profile) — this file is only ever read
+  // back when Core can't be reached.
   try {
     fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
   } catch (e) {}

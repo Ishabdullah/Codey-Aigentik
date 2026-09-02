@@ -74,5 +74,12 @@
     "data_dir": "/data/data/com.termux/files/home/Aigentik-CLI/data",
     "logs_dir": "/data/data/com.termux/files/home/Aigentik-CLI/data/logs",
     "conversations_dir": "/data/data/com.termux/files/home/Aigentik-CLI/data/conversations"
+  },
+  "core_api": {
+    "base_url": "http://127.0.0.1:8770",  // Restoricon Core API base URL — when set, the
+                                          // business profile is read from and written through
+                                          // to Core (see index.js loadProfile / owner-command.js).
+                                          // Omit this whole block to run standalone off profile.json.
+    "token": "<core-api-bearer-token>"    // Bearer token issued by Restoricon Core for this client
   }
 }

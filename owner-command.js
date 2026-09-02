@@ -55,7 +55,35 @@ async function coreRequest(method, urlPath, { query, body } = {}) {
   return { status: response.status, ok: response.ok && !parseError, data, parseError };
 }
 
+// PROFILE_FILE is a write-through cache, not the source of truth. When Core
+// (config.core_api) is reachable it is refreshed from the POST /api/v1/business-profile
+// response after every write, and read via readProfile() only as a fallback when Core is
+// unreachable or hasn't been configured yet. When Core is reachable it is never the read source.
 const PROFILE_FILE = path.join(config.paths.data_dir, 'profile.json');
+
+// Core-first read of the business profile: authoritative when Core is reachable,
+// local cache only as a fallback. Mirrors index.js's loadProfile() read path.
+async function readProfile() {
+  if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    try {
+      const res = await coreRequest('GET', '/api/v1/business-profile');
+      if (res.ok && res.data?.business_profile) return res.data.business_profile;
+      // 404 = not configured in Core yet; fall through to local
+    } catch (e) {
+      log.warn('owner-command', 'Core profile GET failed, using local cache', { error: e.message });
+    }
+  }
+  try {
+    return JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
+  } catch (e) {
+    // No/corrupt local cache AND Core unreachable. Returning {} lets the caller
+    // still attempt a write, but the resulting POST body will be missing fields
+    // and Core's /api/v1/business-profile is an unconditional full-row overwrite
+    // (automation_service.upsert_business_profile) — so callers layer the changed
+    // field on top and accept that unknown fields fall back to Core's defaults.
+    return {};
+  }
+}
 
 // Pending confirmations for destructive actions
 const pendingConfirmations = new Map();
@@ -70,10 +98,7 @@ let currentReplyTarget = null;
 let currentReplySubject = 'Aigentik';
 
 function getAigentikName() {
-  try {
-    const profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-    return profile.aigentik_name || 'Aigentik';
-  } catch (e) { return 'Aigentik'; }
+  return config.aigentik_name || 'Aigentik';
 }
 
 async function reply(message) {
@@ -93,10 +118,7 @@ async function reply(message) {
 async function handleRename(newName, customReply, silent = false) {
   const replyFn = customReply || reply;
   try {
-    let profile = {};
-    try {
-      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-    } catch (e) {}
+    let profile = await readProfile();
     const oldName = profile.aigentik_name || 'Aigentik';
     const trimmed = (newName || '').trim();
     if (!trimmed) {
@@ -106,14 +128,12 @@ async function handleRename(newName, customReply, silent = false) {
     const name = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
     profile.aigentik_name = name;
     profile.agent_name_set = true;
-    try {
-      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
-    } catch (e) {}
-    config.aigentik_name = name;
 
-    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    const coreConfigured = Boolean(CORE_API_BASE_URL && CORE_API_TOKEN);
+    let coreSynced = false;
+    if (coreConfigured) {
       try {
-        await coreRequest('POST', '/api/v1/business-profile', {
+        const res = await coreRequest('POST', '/api/v1/business-profile', {
           body: {
             ...profile,
             aigentik_name: name,
@@ -122,13 +142,43 @@ async function handleRename(newName, customReply, silent = false) {
             onboarding_sent: profile.onboarding_sent ? 1 : 0
           }
         });
+        if (res.ok && res.data?.business_profile) {
+          // Refresh the write-through cache from Core's authoritative response.
+          // A failed local write here is non-fatal — Core holds the saved value.
+          const saved = res.data.business_profile;
+          config.aigentik_name = saved.aigentik_name || 'Aigentik';
+          config.owner_name = saved.owner_name || null;
+          config.business_name = saved.business_name || null;
+          config.business_description = saved.business_description || null;
+          try { fs.writeFileSync(PROFILE_FILE, JSON.stringify(saved, null, 2)); } catch (e) {}
+          coreSynced = true;
+        } else {
+          // coreRequest() returns { ok: false } (no throw) on a non-2xx such as
+          // an expired token — fall through to the durable local write below.
+          log.warn('owner-command', 'Core rejected the rename write; saving locally', { status: res.status });
+        }
       } catch (e) {
-        log.error('owner-command', 'Failed to sync rename to Core API', { error: e.message });
+        log.warn('owner-command', 'Core rename write failed; saving locally', { error: e.message });
       }
     }
 
+    if (!coreSynced) {
+      // No Core configured, or Core was unreachable / rejected the write. Keep
+      // the owner's edit durable locally. loadProfile() never re-POSTs this file
+      // and the next edit while Core is reachable GETs fresh first, so this can't
+      // reintroduce the stale-overwrite bug this change fixes.
+      try {
+        fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+      } catch (e) {}
+      config.aigentik_name = name;
+    }
+
     if (!silent) {
-      await replyFn(`Done! I'll now go by "${name}" instead of "${oldName}". 😊`);
+      if (coreConfigured && !coreSynced) {
+        await replyFn(`Saved "${name}" here, but I couldn't reach the main system to sync it — it'll catch up next time I connect.`);
+      } else {
+        await replyFn(`Done! I'll now go by "${name}" instead of "${oldName}". 😊`);
+      }
     }
     log.action('owner-command', `Renamed from ${oldName} to ${name}`);
   } catch (e) {
@@ -201,15 +251,12 @@ function markConfiguredIfComplete(profile) {
 async function handleSetBusinessInfo(businessName, businessDescription, ownerName, customReply) {
   const replyFn = customReply || reply;
   try {
-    let profile = {};
-    try {
-      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-    } catch (e) {}
+    let profile = await readProfile();
     const parts = [];
 
-    if (ownerName && !profile.owner_name) {
+    const ownerNameApplied = Boolean(ownerName && !profile.owner_name);
+    if (ownerNameApplied) {
       profile.owner_name = ownerName;
-      config.owner_name = ownerName;
       parts.push(`I'll call you ${ownerName}`);
     }
 
@@ -219,19 +266,16 @@ async function handleSetBusinessInfo(businessName, businessDescription, ownerNam
     if (businessName !== profile.business_name) profile.business_description = null;
     profile.business_name = businessName;
     if (businessDescription) profile.business_description = businessDescription;
-    config.business_name = profile.business_name;
-    config.business_description = profile.business_description;
     parts.push(`I now work as the secretary for ${businessName}` +
       (profile.business_description ? `, ${profile.business_description}` : ''));
 
     markConfiguredIfComplete(profile);
-    try {
-      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
-    } catch (e) {}
 
-    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    const coreConfigured = Boolean(CORE_API_BASE_URL && CORE_API_TOKEN);
+    let coreSynced = false;
+    if (coreConfigured) {
       try {
-        await coreRequest('POST', '/api/v1/business-profile', {
+        const res = await coreRequest('POST', '/api/v1/business-profile', {
           body: {
             ...profile,
             business_name: businessName,
@@ -242,12 +286,40 @@ async function handleSetBusinessInfo(businessName, businessDescription, ownerNam
             onboarding_sent: profile.onboarding_sent ? 1 : 0
           }
         });
+        if (res.ok && res.data?.business_profile) {
+          // Refresh the write-through cache from Core's authoritative response.
+          const saved = res.data.business_profile;
+          config.aigentik_name = saved.aigentik_name || 'Aigentik';
+          config.owner_name = saved.owner_name || null;
+          config.business_name = saved.business_name || null;
+          config.business_description = saved.business_description || null;
+          try { fs.writeFileSync(PROFILE_FILE, JSON.stringify(saved, null, 2)); } catch (e) {}
+          coreSynced = true;
+        } else {
+          // { ok: false } (no throw) on a non-2xx — fall through to local write.
+          log.warn('owner-command', 'Core rejected the business-info write; saving locally', { status: res.status });
+        }
       } catch (e) {
-        log.error('owner-command', 'Failed to sync business info to Core API', { error: e.message });
+        log.warn('owner-command', 'Core business-info write failed; saving locally', { error: e.message });
       }
     }
 
-    await replyFn(`Got it — ${parts.join('. ')}. 😊`);
+    if (!coreSynced) {
+      // No Core configured, or Core unreachable / rejected — keep the edit
+      // durable locally (see the handleRename note on why this is safe).
+      if (ownerNameApplied) config.owner_name = ownerName;
+      config.business_name = profile.business_name;
+      config.business_description = profile.business_description;
+      try {
+        fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+      } catch (e) {}
+    }
+
+    if (coreConfigured && !coreSynced) {
+      await replyFn(`Saved here — ${parts.join('. ')} — but I couldn't reach the main system to sync it yet.`);
+    } else {
+      await replyFn(`Got it — ${parts.join('. ')}. 😊`);
+    }
     log.action('owner-command', `Business info set: ${businessName} — ${profile.business_description || 'no description'}` +
       (ownerName ? `, owner: ${ownerName}` : ''));
   } catch (e) {
@@ -264,22 +336,20 @@ async function handleSetBusinessInfo(businessName, businessDescription, ownerNam
 async function handleSetOwnerName(ownerName, customReply) {
   const replyFn = customReply || reply;
   try {
-    let profile = {};
-    try {
-      profile = JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8'));
-    } catch (e) {}
+    let profile = await readProfile();
     const oldName = profile.owner_name;
     profile.owner_name = ownerName;
     markConfiguredIfComplete(profile);
-    try {
-      fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
-    } catch (e) {}
-    config.owner_name = ownerName;
 
-    const configured = (ownerName && config.business_name) ? 1 : 0;
-    if (CORE_API_BASE_URL && CORE_API_TOKEN) {
+    // Derive from the Core-fresh profile, not the boot-time config cache, so a
+    // business_name another client set in Core after boot isn't lost when this
+    // full-row POST overwrites Core's configured flag.
+    const configured = (ownerName && profile.business_name) ? 1 : 0;
+    const coreConfigured = Boolean(CORE_API_BASE_URL && CORE_API_TOKEN);
+    let coreSynced = false;
+    if (coreConfigured) {
       try {
-        await coreRequest('POST', '/api/v1/business-profile', {
+        const res = await coreRequest('POST', '/api/v1/business-profile', {
           body: {
             ...profile,
             owner_name: ownerName,
@@ -288,14 +358,40 @@ async function handleSetOwnerName(ownerName, customReply) {
             onboarding_sent: profile.onboarding_sent ? 1 : 0
           }
         });
+        if (res.ok && res.data?.business_profile) {
+          // Refresh the write-through cache from Core's authoritative response.
+          const saved = res.data.business_profile;
+          config.aigentik_name = saved.aigentik_name || 'Aigentik';
+          config.owner_name = saved.owner_name || null;
+          config.business_name = saved.business_name || null;
+          config.business_description = saved.business_description || null;
+          try { fs.writeFileSync(PROFILE_FILE, JSON.stringify(saved, null, 2)); } catch (e) {}
+          coreSynced = true;
+        } else {
+          // { ok: false } (no throw) on a non-2xx — fall through to local write.
+          log.warn('owner-command', 'Core rejected the owner-name write; saving locally', { status: res.status });
+        }
       } catch (e) {
-        log.error('owner-command', 'Failed to sync owner name to Core API', { error: e.message });
+        log.warn('owner-command', 'Core owner-name write failed; saving locally', { error: e.message });
       }
     }
 
-    await replyFn(oldName && oldName !== ownerName
-      ? `Got it — I'll call you ${ownerName} instead of ${oldName}. 😊`
-      : `Got it — I'll call you ${ownerName}. 😊`);
+    if (!coreSynced) {
+      // No Core configured, or Core unreachable / rejected — keep the edit
+      // durable locally (see the handleRename note on why this is safe).
+      config.owner_name = ownerName;
+      try {
+        fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2));
+      } catch (e) {}
+    }
+
+    if (coreConfigured && !coreSynced) {
+      await replyFn(`Saved ${ownerName} here, but I couldn't reach the main system to sync it yet.`);
+    } else {
+      await replyFn(oldName && oldName !== ownerName
+        ? `Got it — I'll call you ${ownerName} instead of ${oldName}. 😊`
+        : `Got it — I'll call you ${ownerName}. 😊`);
+    }
     log.action('owner-command', `Owner name set: ${ownerName}` + (oldName ? ` (was ${oldName})` : ''));
   } catch (e) {
     await replyFn('Sorry, I had trouble saving that. Try again.');
@@ -1480,5 +1576,6 @@ export {
   handleRename,
   handleSetBusinessInfo,
   handleSetOwnerName,
+  getAigentikName,
   coreRequest
 };

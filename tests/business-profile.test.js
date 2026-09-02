@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import config from '../config.json' with { type: 'json' };
 import { loadProfile, sendOnboardingEmail } from '../index.js';
-import { handleRename, handleSetBusinessInfo, handleSetOwnerName } from '../owner-command.js';
+import { handleRename, handleSetBusinessInfo, handleSetOwnerName, getAigentikName } from '../owner-command.js';
 import { getEmailProvider } from '../email-provider.js';
 
 describe('business-profile (Core write-through)', () => {
@@ -174,74 +174,167 @@ describe('business-profile (Core write-through)', () => {
   });
 
   describe('owner-command handlers (handleRename, handleSetBusinessInfo, handleSetOwnerName)', () => {
-    it('handleRename updates config, local cache, and calls Core API POST', async () => {
-      fetchSpy.mockResolvedValue(mockResponse(200, {
-        business_profile: { id: 1, aigentik_name: 'Codey', agent_name_set: 1 }
-      }));
+    // Full Core profile echoed back by both the GET pre-read and the POST response.
+    function coreProfile(overrides = {}) {
+      return {
+        id: 1,
+        configured: 1,
+        aigentik_name: 'Aigentik',
+        agent_name_set: 0,
+        owner_name: null,
+        business_name: null,
+        business_description: null,
+        onboarding_sent: 0,
+        setup_date: '2026-01-01T00:00:00.000Z',
+        updated_at: '2026-01-02T00:00:00.000Z',
+        ...overrides
+      };
+    }
+    function postCall() {
+      return fetchSpy.mock.calls.find((c) => c[1] && c[1].method === 'POST');
+    }
+
+    it('handleRename builds the POST from Core, not the local file, and refreshes config from the response', async () => {
+      fs.writeFileSync(profilePath, JSON.stringify({ aigentik_name: 'FromDisk', business_name: 'FromDiskBiz' }, null, 2));
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          business_profile: coreProfile({ aigentik_name: 'FromCore', business_name: 'FromCoreBiz' })
+        }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          business_profile: coreProfile({ aigentik_name: 'Newname', business_name: 'FromCoreBiz', agent_name_set: 1 })
+        }));
       const replies = [];
-      const customReply = async (msg) => { replies.push(msg); };
+      await handleRename('newname', async (m) => { replies.push(m); });
 
-      await handleRename('codey', customReply);
-
-      expect(config.aigentik_name).toBe('Codey');
-      expect(replies.length).toBe(1);
-      expect(replies[0]).toContain('Codey');
-
-      expect(fetchSpy).toHaveBeenCalled();
-      const [url, options] = fetchSpy.mock.calls[0];
-      expect(String(url)).toContain('/api/v1/business-profile');
-      expect(options.method).toBe('POST');
-      const body = JSON.parse(options.body);
-      expect(body.aigentik_name).toBe('Codey');
+      // pre-read was the Core GET
+      expect(fetchSpy.mock.calls[0][1].method).toBe('GET');
+      // old name came from Core, not the stale disk value
+      expect(replies[0]).toContain('FromCore');
+      expect(replies[0]).not.toContain('FromDisk');
+      // POST body carries the Core business_name through, renamed agent name
+      const body = JSON.parse(postCall()[1].body);
+      expect(body.business_name).toBe('FromCoreBiz');
+      expect(body.aigentik_name).toBe('Newname');
       expect(body.agent_name_set).toBe(1);
+      // config refreshed from the POST response, not from local disk
+      expect(config.aigentik_name).toBe('Newname');
+      expect(config.business_name).toBe('FromCoreBiz');
     });
 
-    it('handleSetBusinessInfo updates config, local cache, and calls Core API POST', async () => {
-      fetchSpy.mockResolvedValue(mockResponse(200, {
-        business_profile: { id: 1, business_name: 'Restoricon LLC', business_description: 'General Contractor', configured: 1 }
-      }));
-      const replies = [];
-      const customReply = async (msg) => { replies.push(msg); };
+    it('handleSetOwnerName guards against a lost update — POST carries the current Core business_name, not the stale local one', async () => {
+      fs.writeFileSync(profilePath, JSON.stringify({ business_name: 'STALE' }, null, 2));
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ business_name: 'CURRENT' }) }))
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ business_name: 'CURRENT', owner_name: 'X' }) }));
+      await handleSetOwnerName('X', async () => {});
 
-      await handleSetBusinessInfo('Restoricon LLC', 'General Contractor', 'Ish', customReply);
+      const postOptions = postCall()[1];
+      expect(JSON.parse(postOptions.body).business_name).toBe('CURRENT');
+    });
+
+    it('a thrown Core error still persists the rename locally and warns the owner it did not sync', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ aigentik_name: 'Original' }) }))
+        .mockRejectedValueOnce(new Error('Core unreachable'));
+      const replies = [];
+      await handleRename('brandnew', async (m) => { replies.push(m); });
+
+      // Durable: local cache + in-memory config both updated despite the failure.
+      expect(config.aigentik_name).toBe('Brandnew');
+      expect(JSON.parse(fs.readFileSync(profilePath, 'utf8')).aigentik_name).toBe('Brandnew');
+      // Degraded reply — not the normal "Done!" success line.
+      expect(replies[0]).not.toMatch(/Done!/);
+      expect(replies[0]).toMatch(/couldn't reach/i);
+    });
+
+    it('a non-2xx Core response (ok:false, no throw) still persists locally and warns', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ aigentik_name: 'Original' }) }))
+        .mockResolvedValueOnce(mockResponse(401, { error: 'token expired' }));
+      const replies = [];
+      await handleRename('brandnew', async (m) => { replies.push(m); });
+
+      expect(config.aigentik_name).toBe('Brandnew');
+      expect(JSON.parse(fs.readFileSync(profilePath, 'utf8')).aigentik_name).toBe('Brandnew');
+      expect(replies[0]).not.toMatch(/Done!/);
+      expect(replies[0]).toMatch(/couldn't reach/i);
+    });
+
+    it('getAigentikName() reads config only, never the filesystem', () => {
+      const spy = jest.spyOn(fs, 'readFileSync');
+      config.aigentik_name = 'Cached';
+      expect(getAigentikName()).toBe('Cached');
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('a successful POST refreshes the local config cache from the response body', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile() }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          business_profile: coreProfile({ aigentik_name: 'Renamed', owner_name: 'Ish', business_name: 'Restoricon LLC' })
+        }));
+      await handleRename('whatever', async () => {});
+      // config reflects the POST response body, not the 'whatever' we sent
+      expect(config.aigentik_name).toBe('Renamed');
+      expect(config.owner_name).toBe('Ish');
+      expect(config.business_name).toBe('Restoricon LLC');
+    });
+
+    it('handleRename still writes the local cache and updates config when Core echoes the new name', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile() }))
+        .mockResolvedValueOnce(mockResponse(200, {
+          business_profile: coreProfile({ aigentik_name: 'Codey', agent_name_set: 1 })
+        }));
+      const replies = [];
+      await handleRename('codey', async (m) => { replies.push(m); });
+
+      expect(config.aigentik_name).toBe('Codey');
+      expect(replies[0]).toContain('Codey');
+      const written = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+      expect(written.aigentik_name).toBe('Codey');
+      expect(postCall()[1].method).toBe('POST');
+    });
+
+    it('handleSetBusinessInfo posts business fields and refreshes config from the response', async () => {
+      const echoed = coreProfile({
+        business_name: 'Restoricon LLC', business_description: 'General Contractor',
+        owner_name: 'Ish', configured: 1
+      });
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile() }))
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: echoed }));
+      const replies = [];
+      await handleSetBusinessInfo('Restoricon LLC', 'General Contractor', 'Ish', async (m) => { replies.push(m); });
 
       expect(config.business_name).toBe('Restoricon LLC');
       expect(config.business_description).toBe('General Contractor');
       expect(config.owner_name).toBe('Ish');
-      expect(replies.length).toBe(1);
       expect(replies[0]).toContain('Restoricon LLC');
 
-      expect(fetchSpy).toHaveBeenCalled();
-      const [url, options] = fetchSpy.mock.calls[0];
-      expect(String(url)).toContain('/api/v1/business-profile');
-      expect(options.method).toBe('POST');
-      const body = JSON.parse(options.body);
+      const body = JSON.parse(postCall()[1].body);
       expect(body.business_name).toBe('Restoricon LLC');
       expect(body.business_description).toBe('General Contractor');
       expect(body.owner_name).toBe('Ish');
       expect(body.configured).toBe(1);
     });
 
-    it('handleSetOwnerName updates config, local cache, and calls Core API POST', async () => {
-      config.business_name = 'Restoricon LLC';
-      fetchSpy.mockResolvedValue(mockResponse(200, {
-        business_profile: { id: 1, owner_name: 'Ish', configured: 1 }
-      }));
+    it('handleSetOwnerName derives POST `configured` from the Core-fresh profile, not the stale boot config', async () => {
+      // Boot-time config has no business_name (or a stale one), but Core — read
+      // fresh in the pre-read — knows a business was set by another client.
+      config.business_name = null;
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ business_name: 'Restoricon LLC' }) }))
+        .mockResolvedValueOnce(mockResponse(200, { business_profile: coreProfile({ owner_name: 'Ish', business_name: 'Restoricon LLC', configured: 1 }) }));
       const replies = [];
-      const customReply = async (msg) => { replies.push(msg); };
-
-      await handleSetOwnerName('Ish', customReply);
+      await handleSetOwnerName('Ish', async (m) => { replies.push(m); });
 
       expect(config.owner_name).toBe('Ish');
-      expect(replies.length).toBe(1);
       expect(replies[0]).toContain('Ish');
-
-      expect(fetchSpy).toHaveBeenCalled();
-      const [url, options] = fetchSpy.mock.calls[0];
-      expect(String(url)).toContain('/api/v1/business-profile');
-      expect(options.method).toBe('POST');
-      const body = JSON.parse(options.body);
+      const body = JSON.parse(postCall()[1].body);
       expect(body.owner_name).toBe('Ish');
+      // Fails if `configured` is derived from config.business_name (null -> 0).
       expect(body.configured).toBe(1);
     });
   });
