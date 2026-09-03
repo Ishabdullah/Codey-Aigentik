@@ -1,10 +1,12 @@
 // llama.js — Aigentik AI communication layer
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 import { buildRecruiterSystemPrompt } from './subcontractor-recruiter.js';
 import { buildCustomerSystemPrompt } from './customer-module.js';
+import * as telemetry from './telemetry.mjs';
 
 const LLAMA_URL = `${config.llama.host}/v1/chat/completions`;
 const MODEL = config.llama.model;
@@ -149,7 +151,20 @@ function textToHtml(text) {
 // Single choke point every caller in this codebase goes through — routing
 // on the active provider here is what lets the rest of the app (and
 // role-router.js, which calls this directly) stay provider-agnostic.
-async function chat(messages, maxTokens = MAX_TOKENS) {
+//
+// `meta` is a new, optional, additive third parameter (Codey-OS telemetry
+// layer design, docs/telemetry_layer_design.md §4/§7 T1 row and fact
+// 0.17). It is NOT consumed by anything in this sub-task — category-A
+// (inference) instrumentation of this choke point is out of T1's scope
+// (design §7: that's T3/T5-equivalent JS-side work, not yet scheduled).
+// It exists now, backward-compatibly, so a caller that already has a
+// `correlation_id` for its logical request (e.g. an extraction call site
+// tying its category-F records together, see extractContactDetails/
+// extractCustomerIntake below) can start passing it through today without
+// a second signature change later. Every existing call site in this
+// codebase calls chat(messages) or chat(messages, maxTokens) and is
+// unaffected.
+async function chat(messages, maxTokens = MAX_TOKENS, meta = null) {
   const provider = getLlmProvider();
   if (provider === 'gemini') return chatGemini(messages, maxTokens);
   if (provider === 'vertex') return chatVertex(messages, maxTokens);
@@ -540,6 +555,124 @@ function isAddressGrounded(address, sourceText) {
   return numbers.some(n => sourceText.includes(n));
 }
 
+// Pure sibling of isAddressGrounded(), added purely to produce telemetry
+// (docs/telemetry_layer_design.md §2.F — "the four-outcome grounding
+// taxonomy"). isAddressGrounded() itself is left byte-identical and stays
+// the sole authority over what gets kept/discarded; this function is
+// called ADDITIONALLY at the same two call sites, never instead of it.
+//
+// Four outcomes (design §2.F's table, quoted here so the mapping is
+// checkable against the source):
+//   not_applicable_no_value  — "The model returned no address at all.
+//                               Short-circuited by `parsed.address &&` at
+//                               the call site — isAddressGrounded() is
+//                               never invoked."
+//   passed_no_numeric_token  — "An address was returned, but
+//                               String(address).match(/\d{2,}/g) found no
+//                               2+-digit run ... The function returns
+//                               true WITHOUT verifying anything."
+//   passed_numeric_match     — "Numeric tokens present and at least one
+//                               appears verbatim in the source text. A
+//                               genuinely verified pass."
+//   rejected                 — "Numeric tokens present, none found in the
+//                               source. The value is discarded."
+//
+// Edge case the design doc leaves unspecified (flagged in the T1
+// handoff): isAddressGrounded('<truthy address>', '<falsy sourceText>')
+// returns false via its combined `!address || !sourceText` guard, i.e.
+// behaviourally a rejection. To keep the documented invariant
+// `classifyAddressGrounding(a, s) === 'rejected' <=> !isAddressGrounded(a, s)`
+// true for every non-falsy `address` (tested in
+// tests/telemetry.test.js), a truthy address with a falsy sourceText
+// classifies as 'rejected' here too, rather than as
+// 'not_applicable_no_value' (which is reserved for a genuinely absent
+// address, matching the call sites' `parsed.address &&` short-circuit).
+function classifyAddressGrounding(address, sourceText) {
+  if (!address) return 'not_applicable_no_value';
+  if (!sourceText) return 'rejected';
+  const numbers = String(address).match(/\d{2,}/g);
+  if (!numbers) return 'passed_no_numeric_token';
+  return numbers.some(n => sourceText.includes(n)) ? 'passed_numeric_match' : 'rejected';
+}
+
+// Emits the category-F telemetry pair (extraction_attempt +, when
+// groundingField is given, grounding_check) for one extraction call.
+// Purely additive instrumentation — wrapped so a failure here can never
+// affect the extraction pipeline's return value or control flow (design
+// constraint 2 / §5.1); telemetry.mjs's own emit() already guards its
+// internals, this is a second, outer guard specific to the fields
+// computed in this function.
+function emitFieldExtractionTelemetry({
+  extractor,
+  requestedFields,
+  parsed,
+  droppedSchemaEchoFields,
+  parseOk,
+  parseErrorClass = null,
+  sourceText,
+  modelBackend,
+  correlationId,
+  groundingField = null,
+  groundingValue = null,
+  groundingSourceText = null
+}) {
+  try {
+    const returnedFields = parsed ? Object.keys(parsed) : [];
+    const nullFields = parsed ? returnedFields.filter(f => parsed[f] === null) : [];
+
+    telemetry.recordExtractionAttempt({
+      emitter: 'aigentik',
+      pid: process.pid,
+      extractor,
+      requestedFields,
+      returnedFields,
+      nullFields,
+      droppedSchemaEchoFields: droppedSchemaEchoFields || [],
+      parseOk,
+      parseErrorClass,
+      sourceChars: (sourceText || '').length,
+      modelBackend,
+      correlationId
+    });
+
+    if (groundingField) {
+      const outcome = classifyAddressGrounding(groundingValue, groundingSourceText);
+      const numbers = groundingValue ? (String(groundingValue).match(/\d{2,}/g) || []) : [];
+      const matched = groundingSourceText
+        ? numbers.filter(n => groundingSourceText.includes(n)).length
+        : 0;
+
+      telemetry.recordGroundingCheck({
+        emitter: 'aigentik',
+        pid: process.pid,
+        field: groundingField,
+        outcome,
+        numericTokensInValue: numbers.length,
+        numericTokensMatched: matched,
+        valueSha256: groundingValue ? telemetry.sha256Hex(groundingValue) : null,
+        valueChars: groundingValue ? String(groundingValue).length : 0,
+        sourceChars: (groundingSourceText || '').length,
+        // action_taken is a closed kept|discarded enum (§2.F) with no
+        // code for "not applicable" — not_applicable_no_value discarded
+        // nothing and kept nothing extracted. Flagged in the T1 handoff
+        // as an unspecified taxonomy edge; 'kept' chosen because nothing
+        // was actively thrown away.
+        actionTaken: outcome === 'rejected' ? 'discarded' : 'kept',
+        correlationId
+      });
+    }
+  } catch (telemetryErr) {
+    // Telemetry must never affect extraction behaviour (design constraint
+    // 2). Best-effort log, then swallow — the extraction pipeline's
+    // return value/control flow is unaffected either way.
+    try {
+      log.warn('llama', 'telemetry emission failed (non-fatal)', { error: telemetryErr?.message });
+    } catch {
+      // logger itself failing must not compound a telemetry failure
+    }
+  }
+}
+
 async function extractContactDetails(text, fields) {
   const schema = '{' + fields.map(f => `"${f}":"string|null"`).join(',') + '}';
   const systemMsg = `Extract the following contact details if mentioned in this message: ${fields.join(', ')}. Return ONLY valid JSON: ${schema}. Use null for anything not mentioned. "address" means a home/mailing address. Be sure to extract email addresses precisely as provided by the user (even if it's just the email address itself).`;
@@ -547,25 +680,65 @@ async function extractContactDetails(text, fields) {
     { role: 'system', content: systemMsg },
     { role: 'user', content: `Message: "${text}"` }
   ];
+  // Telemetry-only (design §2.0's correlation_id: "links A <-> B <-> E <->
+  // F for one logical request"). Generated regardless of whether telemetry
+  // is enabled — it's a cheap UUID, not an I/O call — and threaded through
+  // chat()'s new optional `meta` param so a future category-A JS emission
+  // at that choke point can already tie back to this extraction.
+  const correlationId = crypto.randomUUID().replace(/-/g, '');
+  const modelBackend = getLlmProvider();
   try {
-    const raw = await chat(messages, 200);
+    const raw = await chat(messages, 200, { correlationId });
     const parsed = extractJson(raw);
     if (!parsed) throw new Error('No JSON object found in response');
+
+    // Captured BEFORE the existing discard below overwrites parsed.address
+    // — classifyAddressGrounding() needs the value isAddressGrounded() was
+    // actually evaluated against, not the post-discard null.
+    const originalAddressValue = parsed.address;
+
     if (parsed.address && !isAddressGrounded(parsed.address, text)) {
       log.warn('llama', 'Discarding ungrounded address extraction (likely hallucinated)', { extracted: parsed.address, source: text.slice(0, 150) });
       parsed.address = null;
     }
-    
+
     // Explicitly delete keys where value is hallucinated string representing type
+    const preCleanupKeys = Object.keys(parsed);
     for (const key of Object.keys(parsed)) {
       if (parsed[key] === 'string' || parsed[key] === 'string|null' || parsed[key] === 'boolean' || parsed[key] === 'number') {
         delete parsed[key];
       }
     }
-    
+
+    emitFieldExtractionTelemetry({
+      extractor: 'contact_details',
+      requestedFields: fields,
+      parsed,
+      droppedSchemaEchoFields: preCleanupKeys.filter(k => !(k in parsed)),
+      parseOk: true,
+      sourceText: text,
+      modelBackend,
+      correlationId,
+      groundingField: 'address',
+      groundingValue: originalAddressValue,
+      groundingSourceText: text
+    });
+
     return parsed;
   } catch (e) {
     log.warn('llama', 'Failed to extract contact details', { error: e.message });
+    emitFieldExtractionTelemetry({
+      extractor: 'contact_details',
+      requestedFields: fields,
+      parsed: null,
+      droppedSchemaEchoFields: [],
+      parseOk: false,
+      parseErrorClass: e?.constructor?.name || 'Error',
+      sourceText: text,
+      modelBackend,
+      correlationId,
+      groundingField: null
+    });
     return fields.reduce((o, f) => { o[f] = null; return o; }, {});
   }
 }
@@ -718,26 +891,82 @@ async function extractCustomerIntake(message, currentData = {}) {
     { role: 'user', content: `Message: "${message}"\nCurrent Data: ${JSON.stringify(currentData)}` }
   ];
 
+  // requestedFields is derived from the same schema string the prompt
+  // already builds, rather than a separately maintained list — a pure
+  // read, no behaviour change (extractContactDetails has an explicit
+  // `fields` argument for this; extractCustomerIntake's schema is fixed
+  // inline, so this is its equivalent).
+  const requestedFields = Object.keys(JSON.parse(schema));
+  const correlationId = crypto.randomUUID().replace(/-/g, '');
+  const modelBackend = getLlmProvider();
+
   try {
-    const raw = await chat(messages, 400);
+    const raw = await chat(messages, 400, { correlationId });
     const parsed = extractJson(raw);
-    if (!parsed) return {};
+    if (!parsed) {
+      emitFieldExtractionTelemetry({
+        extractor: 'customer_intake',
+        requestedFields,
+        parsed: null,
+        droppedSchemaEchoFields: [],
+        parseOk: false,
+        parseErrorClass: null,
+        sourceText: message,
+        modelBackend,
+        correlationId,
+        groundingField: null
+      });
+      return {};
+    }
+
+    // Captured BEFORE the existing discard below overwrites
+    // parsed.property_address — see extractContactDetails' identical
+    // comment.
+    const originalPropertyAddressValue = parsed.property_address;
+
     // Same hallucination risk (and same fix) as extractContactDetails' address field.
     if (parsed.property_address && !isAddressGrounded(parsed.property_address, message)) {
       log.warn('llama', 'Discarding ungrounded property_address extraction (likely hallucinated)', { extracted: parsed.property_address, source: message.slice(0, 150) });
       parsed.property_address = null;
     }
-    
+
     // Explicitly delete keys where value is hallucinated string representing type
+    const preCleanupKeys = Object.keys(parsed);
     for (const key of Object.keys(parsed)) {
       if (parsed[key] === 'string' || parsed[key] === 'string|null' || parsed[key] === 'boolean' || parsed[key] === 'number') {
         delete parsed[key];
       }
     }
-    
+
+    emitFieldExtractionTelemetry({
+      extractor: 'customer_intake',
+      requestedFields,
+      parsed,
+      droppedSchemaEchoFields: preCleanupKeys.filter(k => !(k in parsed)),
+      parseOk: true,
+      sourceText: message,
+      modelBackend,
+      correlationId,
+      groundingField: 'property_address',
+      groundingValue: originalPropertyAddressValue,
+      groundingSourceText: message
+    });
+
     return parsed;
   } catch (err) {
     log.warn('llama', 'Failed to extract customer intake JSON', { error: err.message });
+    emitFieldExtractionTelemetry({
+      extractor: 'customer_intake',
+      requestedFields,
+      parsed: null,
+      droppedSchemaEchoFields: [],
+      parseOk: false,
+      parseErrorClass: err?.constructor?.name || 'Error',
+      sourceText: message,
+      modelBackend,
+      correlationId,
+      groundingField: null
+    });
     return {};
   }
 }
@@ -816,5 +1045,7 @@ export {
   buildEmailSignature,
   textToHtml,
   SIGNATURE_ICON_PATH,
-  SIGNATURE_ICON_CID
+  SIGNATURE_ICON_CID,
+  isAddressGrounded,
+  classifyAddressGrounding
 };

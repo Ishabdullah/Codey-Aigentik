@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "_doc": "Codey-OS telemetry schema — single source of truth, mirrored byte-identical in Codey-Aigentik. See docs/telemetry_layer_design.md for the full design and rationale. Do not edit in place; a definition change bumps schema_version and creates v<N+1>.json instead.",
+
+  "envelope": {
+    "_doc": "Fields present at the top level of every record in every category, in both languages.",
+    "fields": {
+      "schema_version": {"type": "int", "nullable": false},
+      "schema_sha256": {"type": "string", "nullable": false, "format": "12 lowercase hex chars"},
+      "event_id": {"type": "string", "nullable": false, "format": "32 lowercase hex (uuid4().hex)"},
+      "run_id": {"type": "string", "nullable": false, "format": "16 lowercase hex"},
+      "boot_id": {"type": "string", "nullable": true, "format": "UUID"},
+      "seq": {"type": "int", "nullable": false, "doc": "Per-run monotonic counter starting at 0, assigned at emit time (not at write time) so a gap proves a dropped record."},
+      "ts_wall": {"type": "float", "nullable": false, "unit": "Unix seconds, UTC"},
+      "ts_mono": {"type": "float", "nullable": false, "unit": "seconds since process start (time.monotonic())"},
+      "category": {"type": "string", "nullable": false, "enum": ["inference", "gate", "device", "cotenancy", "task", "extraction", "provenance", "meta"]},
+      "event_type": {"type": "string", "nullable": false, "doc": "Enum per category — see categories.<name>.event_types."},
+      "emitter": {"type": "string", "nullable": false, "enum": ["codey-os.daemon", "codey-os.tui", "codey-os.core-api", "codey-os.plannd", "codey-os.loader", "aigentik"]},
+      "pid": {"type": "int", "nullable": false},
+      "correlation_id": {"type": "string", "nullable": true, "format": "32 hex"},
+      "nulls": {"type": "object", "nullable": false, "doc": "{field_path: reason_code}. Present (possibly empty) on every record. Non-empty only when at least one field elsewhere in the record is null. field_path is the bare envelope field name (e.g. \"boot_id\") or \"body.<field>\" for a body field."},
+      "body": {"type": "object", "nullable": false, "doc": "Category-specific payload — see categories.<name>."}
+    },
+    "record_size_cap_bytes": 8192
+  },
+
+  "null_reason_codes": [
+    "proc_stat_permission_denied",
+    "proc_uptime_permission_denied",
+    "thermal_zone_unreadable",
+    "battery_read_failed",
+    "battery_read_timeout",
+    "zram_stats_unavailable",
+    "server_timings_absent",
+    "server_usage_absent",
+    "call_site_not_yet_tagged",
+    "model_sha256_not_computed",
+    "git_command_unavailable",
+    "remote_backend_no_local_metrics",
+    "state_store_unreadable",
+    "truncated_oversize_record",
+    "value_redacted_by_policy",
+    "boot_id_unreadable",
+    "correlation_id_not_yet_available"
+  ],
+
+  "categories": {
+    "inference": {
+      "event_types": ["completion", "completion_failed"],
+      "body_fields": {
+        "role": {"type": "string", "nullable": true},
+        "thinking_mode": {"type": "bool", "nullable": true},
+        "backend": {"type": "string", "nullable": false, "enum": ["local", "gemini", "vertex", "openrouter", "unlimitedclaude", "core_proxy"]},
+        "model_file": {"type": "string", "nullable": true},
+        "model_quant": {"type": "string", "nullable": true},
+        "model_sha256": {"type": "string", "nullable": true},
+        "n_ctx": {"type": "int", "nullable": true, "unit": "tokens"},
+        "prompt_tokens": {"type": "int", "nullable": true, "unit": "tokens"},
+        "completion_tokens": {"type": "int", "nullable": true, "unit": "tokens"},
+        "cached_prompt_tokens": {"type": "int", "nullable": true, "unit": "tokens"},
+        "prefix_cache_hit": {"type": "bool", "nullable": true},
+        "prefill_tps": {"type": "float", "nullable": true, "unit": "tokens/s"},
+        "generation_tps": {"type": "float", "nullable": true, "unit": "tokens/s"},
+        "prefill_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "generation_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "prompt_per_token_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "predicted_per_token_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "ttft_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "wall_ms": {"type": "float", "nullable": false, "unit": "ms"},
+        "queue_wait_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "finish_reason": {"type": "string", "nullable": true, "enum": ["stop", "length", "tool_calls"]},
+        "interactive": {"type": "bool", "nullable": false},
+        "server_request_id": {"type": "string", "nullable": true},
+        "server_fingerprint": {"type": "string", "nullable": true},
+        "stream": {"type": "bool", "nullable": false},
+        "max_tokens_requested": {"type": "int", "nullable": false, "unit": "tokens"},
+        "prompt_sha256": {"type": "string", "nullable": true, "format": "64 hex"},
+        "prompt_chars": {"type": "int", "nullable": false, "unit": "characters"},
+        "message_count": {"type": "int", "nullable": false},
+        "error_class": {"type": "string", "nullable": true}
+      }
+    },
+
+    "gate": {
+      "event_types": ["can_admit", "can_dispatch_task", "reserve_context_budget", "should_trip_shutdown"],
+      "body_fields": {
+        "decision": {"type": "object", "nullable": false, "doc": "dataclasses.asdict() of the decision object, verbatim."},
+        "snapshot": {"type": "object", "nullable": true},
+        "meminfo": {"type": "object", "nullable": true},
+        "reason": {"type": "string", "nullable": false},
+        "admitted_via_swap": {"type": "bool", "nullable": true},
+        "dispatched_via_swap": {"type": "bool", "nullable": true},
+        "swap_bytes_claimed": {"type": "int", "nullable": true, "unit": "bytes"},
+        "budget_ceiling_exceeded": {"type": "bool", "nullable": true},
+        "call_site": {"type": "string", "nullable": false},
+        "retry_count": {"type": "int", "nullable": true},
+        "wait_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "repeat_count": {"type": "int", "nullable": false},
+        "dedup_window_ms": {"type": "float", "nullable": true, "unit": "ms"}
+      }
+    },
+
+    "device": {
+      "event_types": ["sample", "thermal_throttle", "counter_reset"],
+      "body_fields": {
+        "ram_total_bytes": {"type": "int", "nullable": false, "unit": "bytes"},
+        "ram_headroom_bytes": {"type": "int", "nullable": false, "unit": "bytes"},
+        "mem_free_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "mem_available_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "swap_total_bytes": {"type": "int", "nullable": false, "unit": "bytes"},
+        "swap_free_bytes": {"type": "int", "nullable": false, "unit": "bytes"},
+        "swap_used_bytes": {"type": "int", "nullable": false, "unit": "bytes"},
+        "zram_compression_ratio": {"type": "float", "nullable": true},
+        "zram_orig_data_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "zram_compr_data_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "temperature_c": {"type": "float", "nullable": true, "unit": "°C"},
+        "cpu_percent": {"type": "float", "nullable": true, "unit": "%"},
+        "battery_percent": {"type": "int", "nullable": true, "unit": "%"},
+        "battery_charging": {"type": "bool", "nullable": false},
+        "queue_pending": {"type": "int", "nullable": false},
+        "queue_running": {"type": "int", "nullable": false},
+        "inference_active": {"type": "bool", "nullable": false},
+        "inference_seconds_this_run": {"type": "float", "nullable": false, "unit": "s"},
+        "throttle_level": {"type": "string", "nullable": true},
+        "device_uptime_sec": {"type": "int", "nullable": true, "unit": "s", "doc": "Always null on this device — proc_uptime_permission_denied."}
+      }
+    },
+
+    "cotenancy": {
+      "event_types": ["interactive_transition", "dispatch_refused_human_present", "deferral_resolved"],
+      "body_fields": {
+        "detector": {"type": "string", "nullable": false, "enum": ["tui"]},
+        "detector_available": {"type": "array", "nullable": false},
+        "active": {"type": "bool", "nullable": false},
+        "previous_active": {"type": "bool", "nullable": false},
+        "live_session_pids": {"type": "array", "nullable": false},
+        "session_count": {"type": "int", "nullable": false},
+        "state_duration_ms": {"type": "float", "nullable": false, "unit": "ms"},
+        "refused_task_id": {"type": "int", "nullable": true},
+        "refusal_reason": {"type": "string", "nullable": true},
+        "deferral_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "deferral_refusal_count": {"type": "int", "nullable": true},
+        "task_state_preserved": {"type": "bool", "nullable": true}
+      }
+    },
+
+    "task": {
+      "event_types": ["task_started", "task_step", "task_finished"],
+      "body_fields": {
+        "task_id": {"type": "int", "nullable": false},
+        "task_type": {"type": "string", "nullable": false, "enum": ["planner", "direct", "planning_expansion"]},
+        "needs_planning": {"type": "bool", "nullable": false},
+        "started_ts_wall": {"type": "float", "nullable": true, "unit": "Unix s"},
+        "finished_ts_wall": {"type": "float", "nullable": true, "unit": "Unix s"},
+        "duration_ms": {"type": "float", "nullable": true, "unit": "ms"},
+        "terminal_status": {"type": "string", "nullable": true, "enum": ["done", "failed", "timeout", "cancelled", "superseded_by_plan"]},
+        "step_count": {"type": "int", "nullable": true},
+        "max_steps": {"type": "int", "nullable": true},
+        "hit_max_steps": {"type": "bool", "nullable": true},
+        "tools_called": {"type": "object", "nullable": true},
+        "tool_call_total": {"type": "int", "nullable": true},
+        "retries": {"type": "int", "nullable": true},
+        "escalated": {"type": "bool", "nullable": true},
+        "escalation_reason": {"type": "string", "nullable": true, "enum": ["retries_exhausted", "patch_failure"]},
+        "escalation_outcome": {"type": "string", "nullable": true, "enum": ["peer_cli", "parked", "skipped"]},
+        "inference_ms_total": {"type": "float", "nullable": true, "unit": "ms", "doc": "Computed at rollup time from category-A records sharing correlation_id — not tracked separately."},
+        "inference_call_count": {"type": "int", "nullable": true},
+        "error_class": {"type": "string", "nullable": true},
+        "timeout_sec": {"type": "int", "nullable": true, "unit": "s"}
+      }
+    },
+
+    "extraction": {
+      "event_types": ["extraction_attempt", "grounding_check", "deterministic_bypass"],
+      "body_fields": {
+        "extractor": {"type": "string", "nullable": true, "enum": ["contact_details", "subcontractor_details", "customer_intake", "recruiter_qualification", "scheduling_intent"]},
+        "requested_fields": {"type": "array", "nullable": true},
+        "returned_fields": {"type": "array", "nullable": true},
+        "null_fields": {"type": "array", "nullable": true},
+        "dropped_schema_echo_fields": {"type": "array", "nullable": true},
+        "parse_ok": {"type": "bool", "nullable": true},
+        "parse_error_class": {"type": "string", "nullable": true},
+        "source_chars": {"type": "int", "nullable": true, "unit": "characters"},
+        "model_backend": {"type": "string", "nullable": true},
+        "field": {"type": "string", "nullable": true},
+        "outcome": {"type": "string", "nullable": true, "enum": ["not_applicable_no_value", "passed_no_numeric_token", "passed_numeric_match", "rejected"]},
+        "numeric_tokens_in_value": {"type": "int", "nullable": true},
+        "numeric_tokens_matched": {"type": "int", "nullable": true},
+        "value_sha256": {"type": "string", "nullable": true},
+        "value_chars": {"type": "int", "nullable": true},
+        "action_taken": {"type": "string", "nullable": true, "enum": ["kept", "discarded"]},
+        "rule_id": {"type": "string", "nullable": true},
+        "rule_source": {"type": "string", "nullable": true},
+        "would_have_called_model": {"type": "bool", "nullable": true},
+        "estimated_tokens_avoided": {"type": "int", "nullable": true, "doc": "Never written by the raw recorder — derived-only, rollup.py fills it in with derived: true. Always null + call_site_not_yet_tagged is wrong; T0's recorder omits this field's computation entirely and leaves it absent from raw records."},
+        "estimated_ms_avoided": {"type": "float", "nullable": true}
+      }
+    },
+
+    "provenance": {
+      "event_types": ["run_start", "run_end", "run_start_amended"],
+      "body_fields": {
+        "run_id": {"type": "string", "nullable": false},
+        "boot_id": {"type": "string", "nullable": true},
+        "emitter": {"type": "string", "nullable": false},
+        "pid": {"type": "int", "nullable": false},
+        "started_ts_wall": {"type": "float", "nullable": false, "unit": "Unix s"},
+        "git_commit_sha": {"type": "string", "nullable": true, "format": "40 hex"},
+        "git_dirty": {"type": "bool", "nullable": true},
+        "git_dirty_file_count": {"type": "int", "nullable": true},
+        "git_branch": {"type": "string", "nullable": true},
+        "repo": {"type": "string", "nullable": false, "enum": ["Codey-OS", "Codey-Aigentik"]},
+        "device_model": {"type": "string", "nullable": true},
+        "android_release": {"type": "string", "nullable": true},
+        "android_sdk": {"type": "int", "nullable": true},
+        "kernel_version": {"type": "string", "nullable": true},
+        "termux_version": {"type": "string", "nullable": true},
+        "python_version": {"type": "string", "nullable": true},
+        "node_version": {"type": "string", "nullable": true},
+        "ram_total_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "swap_total_bytes": {"type": "int", "nullable": true, "unit": "bytes"},
+        "cpu_core_count": {"type": "int", "nullable": true},
+        "device_uptime_sec": {"type": "int", "nullable": true, "unit": "s"},
+        "models": {"type": "array", "nullable": false, "doc": "[{role, path, size_bytes, mtime_ns, sha256, sha256_source}], sha256_source in {computed, cached, not_computed}."},
+        "llama_server_bin": {"type": "string", "nullable": true},
+        "llama_build_info": {"type": "string", "nullable": true},
+        "llama_server_argv": {"type": "array", "nullable": true},
+        "env_overrides": {"type": "object", "nullable": false},
+        "config_snapshot": {"type": "object", "nullable": false},
+        "schema_version": {"type": "int", "nullable": false},
+        "schema_sha256": {"type": "string", "nullable": false}
+      }
+    },
+
+    "meta": {
+      "event_types": ["writer_started", "writer_stopped", "records_dropped", "counter_reset", "rotation", "schema_mismatch", "writer_disabled", "emit_cost"],
+      "body_fields": {
+        "dropped_total": {"type": "int", "nullable": true, "unit": "records"},
+        "dropped_by_category": {"type": "object", "nullable": true},
+        "drop_reason": {"type": "string", "nullable": true, "enum": ["ring_buffer_full", "write_failed", "serialize_failed"]},
+        "buffer_high_water": {"type": "int", "nullable": true, "unit": "records"},
+        "flush_count": {"type": "int", "nullable": true},
+        "bytes_written": {"type": "int", "nullable": true, "unit": "bytes"},
+        "emit_ns_p50": {"type": "int", "nullable": true, "unit": "ns"},
+        "emit_ns_p95": {"type": "int", "nullable": true, "unit": "ns"},
+        "emit_ns_max": {"type": "int", "nullable": true, "unit": "ns"},
+        "counters_reset": {"type": "array", "nullable": true},
+        "reason": {"type": "string", "nullable": true}
+      }
+    }
+  },
+
+  "env_allow_list": [
+    "CODEY_N_CTX",
+    "CODEY_SWAP_ASSIST_ADMISSION",
+    "CODEY_7B_MMAP",
+    "CODEY_7B_MLOCK",
+    "CODEY_BACKEND",
+    "CODEY_BACKEND_P",
+    "CODEY_MODEL",
+    "CODEY_EMBED_MODEL",
+    "CODEY_PRIMARY_PORT",
+    "CODEY_EMBED_PORT",
+    "CODEY_RECURSIVE",
+    "CODEY_SYMBOLIC",
+    "CODEY_SHUTDOWN_TRIP_AFTER_SEC",
+    "CODEY_LLAMA_SERVER",
+    "CODEY_STATE_DIR",
+    "CODEY_TELEMETRY"
+  ],
+  "secret_presence_only_env": [
+    "OPENROUTER_API_KEY",
+    "UNLIMITEDCLAUDE_API_KEY",
+    "CLOUDFLARE_TUNNEL_TOKEN"
+  ]
+}
