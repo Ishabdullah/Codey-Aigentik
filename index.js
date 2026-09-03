@@ -15,6 +15,7 @@ import path from 'path';
 import log from './logger.js';
 import config from './config.json' with { type: 'json' };
 import pkg from './package.json' with { type: 'json' };
+import * as telemetry from './telemetry.mjs';
 import * as llama from './llama.js';
 import * as gmail from './gmail.js';
 import * as ownerCommand from './owner-command.js';
@@ -1628,8 +1629,36 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+function recordTelemetryRunStart() {
+  // Category-G run provenance (docs/telemetry_layer_design.md §2.G, sub-
+  // task T2). Emitted once, at process start, before anything else in
+  // main() runs. Wrapped defensively even though telemetry.recordRunStart
+  // is already internally exception-proof by its own contract (mirrors
+  // emit()'s own last-line-of-defense try/catch) -- a telemetry
+  // regression must never be able to prevent Aigentik from starting.
+  try {
+    const models = telemetry.buildModelEntries([['primary', config.llama?.model]].filter(([, p]) => p));
+    telemetry.recordRunStart({
+      emitter: 'aigentik',
+      pid: process.pid,
+      repo: 'Codey-Aigentik',
+      startedTsWall: Date.now() / 1000,
+      models,
+      llamaServerBin: config.llama?.llama_server_path || null
+    });
+  } catch (exc) {
+    try {
+      log.warn('telemetry', `failed to record run_start: ${exc}`);
+    } catch {
+      // see other identical guards throughout telemetry.mjs
+    }
+  }
+}
+
 async function main() {
   console.log('\n🤖 Aigentik v' + pkg.version + ' — Starting up...\n');
+
+  recordTelemetryRunStart();
 
   await loadProfile();
 

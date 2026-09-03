@@ -26,6 +26,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { performance } from 'perf_hooks';
 import { fileURLToPath } from 'url';
 import config from './config.json' with { type: 'json' };
@@ -476,7 +477,11 @@ export function getStoreForTests(rootOverride) {
 // ── generic emit ───────────────────────────────────────────────────────
 
 function emit({ category, eventType, emitter, pid, runId, body, correlationId = null, nulls = null }) {
-  if (!TELEMETRY_ENABLED) return;
+  // Returns the built record (T2: recordRunStart() needs it to also
+  // write runs/<runId>.json; every other existing caller ignores the
+  // return value, so this is additive). Returns null when telemetry is
+  // disabled or the record could not be built at all.
+  if (!TELEMETRY_ENABLED) return null;
   try {
     const prunedBody = pruneBody(body, nulls);
     const resolvedRunId = runId || getRunId();
@@ -492,12 +497,14 @@ function emit({ category, eventType, emitter, pid, runId, body, correlationId = 
     });
     const store = getStore();
     if (store) store.enqueue(record);
+    return record;
   } catch {
     // The absolute last line of defense: nothing above this point should
     // ever throw (buildEnvelope/pruneBody are pure, getStore/enqueue are
     // already internally guarded), but a telemetry call must NEVER be
     // able to raise into an extraction call site no matter what changes
     // underneath it later.
+    return null;
   }
 }
 
@@ -609,5 +616,465 @@ export function recordDeterministicBypass({
     body,
     correlationId,
     nulls
+  });
+}
+
+// ── G. Run provenance (sub-task T2) ─────────────────────────────────────
+// JS-side counterpart to telemetry/provenance.py + recorders.py's
+// record_run_start()/record_run_start_amended() — same body shape, same
+// null-reason discipline, same write-once runs/<run_id>.json convention
+// (design §2.G / §3.1 / §3.4), written under the SAME store root as the
+// Python side (~/.codeyOS/metrics/) so both languages' provenance records
+// interleave into one dataset.
+
+const GIT_TIMEOUT_MS = 2000;
+// Deliberately a DIFFERENT filename from the Python side's
+// model_digests.json (telemetry/provenance.py's MODEL_DIGEST_CACHE_FILE),
+// not a shared one, even though both processes may hash the SAME model
+// file (Aigentik's config.llama.model and Codey-OS's MODEL_PATH are
+// commonly the identical path). A shared file was considered and
+// rejected: Node has no JSON-safe way to round-trip fs.Stats' true
+// nanosecond mtime (BigInt from the {bigint:true} stat option cannot
+// survive JSON.stringify), so this module's mtime_ns is a documented
+// lossy approximation (Math.round(mtimeMs * 1e6)) that will never
+// bit-for-bit equal Python's exact st_mtime_ns for the same file. If both
+// languages wrote the same cache key, each would treat the other's entry
+// as a cache miss on every read, re-hash the full model, and overwrite
+// the other's entry -- a permanent hash-thrash on every process start of
+// either repo, not a one-time redundant hash. A separate cache file per
+// language avoids that entirely, at the cost of one extra one-time hash
+// per language (never repeated once each language's own cache is warm).
+const MODEL_DIGEST_CACHE_FILE = 'model_digests.node.json';
+
+function runGit(args, cwd) {
+  return execFileSync('git', args, { cwd, timeout: GIT_TIMEOUT_MS, encoding: 'utf8' }).trim();
+}
+
+export function getGitProvenance(repoDir) {
+  const result = { commit_sha: null, dirty: null, dirty_file_count: null, branch: null };
+  try {
+    result.commit_sha = runGit(['rev-parse', 'HEAD'], repoDir) || null;
+  } catch {
+    // git missing, not a repo, or timed out -- honest null, not a crash.
+  }
+  try {
+    const porcelain = runGit(['status', '--porcelain'], repoDir);
+    const lines = porcelain.split('\n').filter((l) => l.trim().length > 0);
+    result.dirty = lines.length > 0;
+    result.dirty_file_count = lines.length;
+  } catch {
+    // see above
+  }
+  try {
+    result.branch = runGit(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir) || null;
+  } catch {
+    // see above
+  }
+  return result;
+}
+
+function getprop(name) {
+  try {
+    const out = execFileSync('getprop', [name], { timeout: GIT_TIMEOUT_MS, encoding: 'utf8' }).trim();
+    return out || null;
+  } catch {
+    // getprop not present (non-Android dev box) or the property is unset
+    // -- honest null, not a crash. Mirrors telemetry/provenance.py's
+    // _getprop().
+    return null;
+  }
+}
+
+export function getDeviceProvenance() {
+  let kernelVersion = null;
+  try {
+    kernelVersion = os.release();
+  } catch {
+    // os.release() can, in principle, fail on an unsupported platform --
+    // an honest null rather than a crashed provenance record.
+  }
+  let androidSdk = null;
+  const sdkRaw = getprop('ro.build.version.sdk');
+  if (sdkRaw !== null) {
+    const parsed = parseInt(sdkRaw, 10);
+    androidSdk = Number.isNaN(parsed) ? null : parsed;
+  }
+  let cpuCoreCount = null;
+  try {
+    // Node's os.cpus() reads /proc/stat internally on Linux, which is
+    // permission-denied on this device (fact 0.1 -- the same restriction
+    // documented for CPU%, now also observed here on the JS side, not a
+    // new finding). It returns [] rather than throwing, so an empty
+    // result is treated as "unreadable", not "zero cores" -- 0 would be a
+    // fabricated confirmed value, exactly the honest-null violation fact
+    // 0.1 was written up to avoid.
+    const cpus = os.cpus();
+    cpuCoreCount = cpus.length > 0 ? cpus.length : null;
+  } catch {
+    // see kernelVersion above
+  }
+  return {
+    device_model: getprop('ro.product.model'),
+    android_release: getprop('ro.build.version.release'),
+    android_sdk: androidSdk,
+    kernel_version: kernelVersion,
+    termux_version: process.env.TERMUX_VERSION || null,
+    node_version: process.version,
+    cpu_core_count: cpuCoreCount
+  };
+}
+
+export function getRamSwapBytes() {
+  // Read directly from /proc/meminfo (not os.totalmem()) to match
+  // telemetry/provenance.py's get_ram_swap_bytes() field-for-field
+  // (MemTotal / SwapTotal), rather than a Node API that may round
+  // differently.
+  const result = { ram_total_bytes: null, swap_total_bytes: null };
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const memMatch = meminfo.match(/^MemTotal:\s+(\d+)\s+kB/m);
+    if (memMatch) result.ram_total_bytes = parseInt(memMatch[1], 10) * 1024;
+    const swapMatch = meminfo.match(/^SwapTotal:\s+(\d+)\s+kB/m);
+    if (swapMatch) result.swap_total_bytes = parseInt(swapMatch[1], 10) * 1024;
+  } catch {
+    // /proc/meminfo unreadable -- honest null, never raised.
+  }
+  return result;
+}
+
+// Allow-list-only projections (§2.G / §8 item 4 / hard constraint 1).
+// Aigentik has no CODEY_*-shaped env vars of its own -- AIGENTIK_TELEMETRY
+// is the only one this process reads, so env_overrides is a one-entry
+// projection rather than a real allow-list walk. config_snapshot instead
+// carries the real secret-adjacency risk: config.json holds
+// core_api.token live (fact 0.21) plus three more credential-shaped
+// fields (gmail.app_password, gemini.api_key, vertex.api_key) that are
+// empty today but are exactly the kind of value this store must never
+// leak if populated later. All four are presence-only booleans, never
+// values -- an extension of the design's explicit core_api.token
+// requirement to every credential-shaped key already in this file, not
+// just the one fact 0.21 happened to find already populated. Flagged as
+// a judgment call: the design doc names only core_api.token explicitly
+// for the JS side.
+const CONFIG_SECRET_PRESENCE_ONLY_PATHS = [
+  ['core_api', 'token'],
+  ['gmail', 'app_password'],
+  ['gemini', 'api_key'],
+  ['vertex', 'api_key']
+];
+
+const CONFIG_ALLOW_LIST_PATHS = [
+  ['llm', 'provider'],
+  ['llama', 'context_size'],
+  ['llama', 'max_tokens'],
+  ['llama', 'temperature'],
+  ['llama', 'threads'],
+  ['behavior', 'paused'],
+  ['behavior', 'pause_email'],
+  ['behavior', 'pause_sms']
+];
+
+function getAtPath(obj, pathParts) {
+  let cur = obj;
+  for (const part of pathParts) {
+    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+export function buildEnvOverrides() {
+  return { AIGENTIK_TELEMETRY: process.env.AIGENTIK_TELEMETRY ?? null };
+}
+
+export function buildConfigSnapshot() {
+  const snapshot = { _policy: 'v1' };
+  for (const pathParts of CONFIG_ALLOW_LIST_PATHS) {
+    const value = getAtPath(config, pathParts);
+    if (value !== undefined) snapshot[pathParts.join('.')] = value;
+  }
+  for (const pathParts of CONFIG_SECRET_PRESENCE_ONLY_PATHS) {
+    const value = getAtPath(config, pathParts);
+    const key = pathParts.join('_') + '_set';
+    snapshot[key] = value !== undefined && value !== null && value !== '';
+  }
+  return snapshot;
+}
+
+// ── Model digest cache (design §3.4) ────────────────────────────────────
+// Cache-READ is synchronous (a tiny JSON file, no different from reading
+// config.json at import); hashing is NEVER synchronous (fact 0.23: ~5.2s
+// for the 2.74GB primary model) and only ever runs inside
+// scheduleColdModelDigests()'s background task below.
+
+export function getModelDigest(modelPath, cachePath) {
+  const cacheFile = cachePath || path.join(DEFAULT_METRICS_ROOT, MODEL_DIGEST_CACHE_FILE);
+  const result = {
+    path: modelPath,
+    size_bytes: null,
+    mtime_ns: null,
+    sha256: null,
+    sha256_source: 'not_computed'
+  };
+  let stat;
+  try {
+    stat = fs.statSync(modelPath);
+  } catch {
+    return result; // file doesn't exist / unreadable -- honest not-computed shape
+  }
+  result.size_bytes = stat.size;
+  // Node's fs.Stats has no true nanosecond mtime without the {bigint:true}
+  // stat option, and BigInt cannot round-trip through JSON.stringify for
+  // the shared model_digests.json cache file. Math.round(mtimeMs * 1e6)
+  // is used instead -- a documented approximation, not the Python side's
+  // exact st_mtime_ns. This is internally consistent (the same lossy
+  // conversion is applied on every read/write from this file), but it
+  // means a cache entry written by the Python side for the SAME model
+  // file will not cache-hit here (and vice versa) -- a missed
+  // optimization (redundant hash), not a correctness bug. Flagged: the
+  // design doc does not specify cross-language mtime_ns representation.
+  result.mtime_ns = Math.round(stat.mtimeMs * 1e6);
+
+  let cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+  } catch {
+    return result; // no cache yet, or corrupt -- cold cache, not an error
+  }
+  const entry = cache[modelPath];
+  if (
+    entry &&
+    typeof entry === 'object' &&
+    entry.size_bytes === result.size_bytes &&
+    entry.mtime_ns === result.mtime_ns &&
+    entry.sha256
+  ) {
+    result.sha256 = entry.sha256;
+    result.sha256_source = 'cached';
+  }
+  return result;
+}
+
+export function buildModelEntries(rolePaths, cachePath) {
+  return rolePaths.map(([role, modelPath]) => ({
+    role,
+    ...getModelDigest(modelPath, cachePath)
+  }));
+}
+
+function computeSha256Async(filePath) {
+  // Streamed via fs.createReadStream so the hash is built incrementally
+  // across async 'data' events rather than one long synchronous read+
+  // hash call -- this is what keeps a ~5.2s hash from blocking Aigentik's
+  // single event-loop thread (fact 0.15 / design §5.2's "never blocks the
+  // caller").
+  return new Promise((resolve) => {
+    try {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', () => resolve(null));
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function writeDigestCacheEntry(cacheFile, modelPath, sizeBytes, mtimeNs, sha256) {
+  try {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    let cache = {};
+    try {
+      cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    } catch {
+      cache = {};
+    }
+    cache[modelPath] = { size_bytes: sizeBytes, mtime_ns: mtimeNs, sha256, computed_at: Date.now() / 1000 };
+    const tmpFile = cacheFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(cache));
+    fs.renameSync(tmpFile, cacheFile);
+  } catch {
+    // Cache write failed (disk full, permission change). The digest was
+    // still computed and is still reported in this run's
+    // run_start_amended record -- only the cache for FUTURE runs is
+    // lost, which just means the next process re-hashes once more.
+  }
+}
+
+export function scheduleColdModelDigests({ models, runId, emitter, pid, cachePath }) {
+  const cacheFile = cachePath || path.join(DEFAULT_METRICS_ROOT, MODEL_DIGEST_CACHE_FILE);
+  const cold = (models || []).filter((m) => m.sha256_source === 'not_computed' && m.path);
+  if (cold.length === 0) return; // nothing to hash -- no background task spawned at all
+
+  // Fire-and-forget: nothing awaits this. It runs after recordRunStart()
+  // has already returned and the caller has moved on with startup.
+  (async () => {
+    try {
+      const amended = [];
+      for (const entry of cold) {
+        let stat;
+        try {
+          stat = fs.statSync(entry.path);
+        } catch {
+          continue; // still unreadable -- no cache update, no amendment
+        }
+        const digest = await computeSha256Async(entry.path);
+        if (digest === null) continue;
+        const mtimeNs = Math.round(stat.mtimeMs * 1e6);
+        writeDigestCacheEntry(cacheFile, entry.path, stat.size, mtimeNs, digest);
+        amended.push({ ...entry, size_bytes: stat.size, mtime_ns: mtimeNs, sha256: digest, sha256_source: 'computed' });
+      }
+      if (amended.length === 0) return;
+      recordRunStartAmended({ emitter, pid, runId, models: amended });
+    } catch {
+      // A background digest/cache-write failure must never surface
+      // anywhere -- this task is fire-and-forget with nothing awaiting
+      // it. The next process's cold-cache read simply retries the hash.
+    }
+  })();
+}
+
+// ── runs/<run_id>.json (design §3.1) ────────────────────────────────────
+
+export function writeRunProvenanceFile(record, rootOverride) {
+  // A one-time synchronous write, same narrow exception to "never
+  // fs.*Sync on the hot path" as emitWriterDisabledRecord() above: it
+  // happens at most once per process, and (mirroring
+  // telemetry/store.py's write_run_provenance()) must exist even if the
+  // process exits before the async ring-buffer writer's first flush --
+  // provenance is meant to be the first durable fact about a run.
+  if (!TELEMETRY_ENABLED || !record || !record.run_id) return;
+  const root = rootOverride || DEFAULT_METRICS_ROOT;
+  const filePath = path.join(root, 'runs', `${record.run_id}.json`);
+  try {
+    if (fs.existsSync(filePath)) return; // write-once, never reopened for write
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = filePath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(record));
+    fs.renameSync(tmpPath, filePath);
+  } catch (exc) {
+    try {
+      log.warn('telemetry', `failed to write run provenance file for run_id=${record.run_id}: ${exc}`);
+    } catch {
+      // see other identical guards in this file
+    }
+  }
+}
+
+export function recordRunStart({
+  emitter,
+  pid,
+  repo,
+  startedTsWall,
+  repoDir = __dirname,
+  models = null,
+  llamaServerBin = null,
+  runId = null,
+  // Test-only overrides (production callers never pass these; defaults
+  // mirror writeRunProvenanceFile()'s / scheduleColdModelDigests()'s own
+  // DEFAULT_METRICS_ROOT-based defaults). Exists because DEFAULT_METRICS_ROOT
+  // is an exported `const` -- an ESM live-binding, not reassignable from a
+  // test the way telemetry/store.py's METRICS_DIR module attribute can be
+  // monkeypatched on the Python side -- so an explicit override parameter
+  // is this module's equivalent test seam.
+  runsRoot = null,
+  cachePath = null
+}) {
+  // Kill switch checked FIRST, before any of the git/getprop/meminfo
+  // collection work below — design §5.3's "checked once ... a single
+  // predictable branch with no object construction" requires this.
+  // Without this early return, a disabled run would still pay for three
+  // execFileSync subprocess spawns (git) plus two more (getprop) --
+  // observed at ~200ms + ~120ms in this module's own tests -- even though
+  // nothing would ever be written. emit()'s own TELEMETRY_ENABLED check
+  // (further down, inside the generic emit() helper) is too late to save
+  // that cost; it only stops the write.
+  if (!TELEMETRY_ENABLED) return;
+
+  const resolvedRunId = runId || getRunId();
+  const gitInfo = getGitProvenance(repoDir);
+  const deviceInfo = getDeviceProvenance();
+  const memInfo = getRamSwapBytes();
+  const resolvedModels = models || [];
+
+  const body = {
+    run_id: resolvedRunId,
+    boot_id: getBootId(),
+    emitter,
+    pid,
+    started_ts_wall: startedTsWall,
+    git_commit_sha: gitInfo.commit_sha,
+    git_dirty: gitInfo.dirty,
+    git_dirty_file_count: gitInfo.dirty_file_count,
+    git_branch: gitInfo.branch,
+    repo,
+    device_model: deviceInfo.device_model,
+    android_release: deviceInfo.android_release,
+    android_sdk: deviceInfo.android_sdk,
+    kernel_version: deviceInfo.kernel_version,
+    termux_version: deviceInfo.termux_version,
+    python_version: null,
+    node_version: deviceInfo.node_version,
+    ram_total_bytes: memInfo.ram_total_bytes,
+    swap_total_bytes: memInfo.swap_total_bytes,
+    cpu_core_count: deviceInfo.cpu_core_count,
+    device_uptime_sec: null,
+    models: resolvedModels,
+    llama_server_bin: llamaServerBin,
+    llama_build_info: null,
+    llama_server_argv: null,
+    env_overrides: buildEnvOverrides(),
+    config_snapshot: buildConfigSnapshot(),
+    schema_version: SCHEMA_VERSION,
+    schema_sha256: SCHEMA_SHA256_12
+  };
+
+  const nulls = {};
+  for (const field of ['git_commit_sha', 'git_dirty', 'git_dirty_file_count', 'git_branch']) {
+    if (body[field] === null) nulls[`body.${field}`] = 'git_command_unavailable';
+  }
+  for (const field of ['ram_total_bytes', 'swap_total_bytes']) {
+    if (body[field] === null) nulls[`body.${field}`] = 'state_store_unreadable';
+  }
+  // cpu_core_count: os.cpus() reads /proc/stat internally and returns []
+  // on this device (fact 0.1, confirmed above in getDeviceProvenance()) --
+  // reusing proc_stat_permission_denied since it is the exact documented
+  // cause, not a new/different failure mode needing its own code.
+  if (body.cpu_core_count === null) nulls['body.cpu_core_count'] = 'proc_stat_permission_denied';
+  nulls['body.device_uptime_sec'] = 'proc_uptime_permission_denied';
+  for (const field of ['llama_build_info', 'llama_server_argv']) {
+    if (body[field] === null) nulls[`body.${field}`] = 'call_site_not_yet_tagged';
+  }
+
+  const record = emit({
+    category: 'provenance',
+    eventType: 'run_start',
+    emitter,
+    pid,
+    runId: resolvedRunId,
+    body,
+    nulls
+  });
+  if (record === null) return; // telemetry disabled or emit failed -- no runs/ file, no digest scheduling
+
+  writeRunProvenanceFile(record, runsRoot);
+  scheduleColdModelDigests({ models: resolvedModels, runId: resolvedRunId, emitter, pid, cachePath });
+}
+
+export function recordRunStartAmended({ emitter, pid, runId, models, correlationId = null }) {
+  // §3.4: a background digest completing after the original run_start
+  // record was already written amends the record STREAM with this
+  // follow-up -- runs/<run_id>.json is never reopened for write
+  // (append-only). Not written to the runs/ file itself.
+  emit({
+    category: 'provenance',
+    eventType: 'run_start_amended',
+    emitter,
+    pid,
+    runId,
+    body: { models },
+    correlationId,
+    nulls: {}
   });
 }

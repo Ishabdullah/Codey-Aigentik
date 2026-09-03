@@ -15,6 +15,7 @@ import { jest } from '@jest/globals';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import config from '../config.json' with { type: 'json' };
 import * as telemetry from '../telemetry.mjs';
 import * as llama from '../llama.js';
@@ -292,5 +293,299 @@ describe("chat()'s new optional third `meta` param stays backward-compatible", (
     expect(reqBody.max_tokens).toBe(77);
     // meta is reserved/unused in T1 — asserting it changes nothing about
     // the outbound request is exactly the backward-compatibility claim.
+  });
+});
+
+// ── T2: category-G run provenance ────────────────────────────────────────
+// docs/telemetry_layer_design.md §2.G, §3.1, §3.4, §8 item 4. Covers the
+// JS-side counterpart to recorders.record_run_start(): git/device/mem
+// provenance, the env/config allow-list closed against secrets, the
+// model-digest cache (background hashing, never inline), and
+// runs/<run_id>.json's write-once convention.
+
+describe('telemetry — T2 git/device/mem provenance helpers', () => {
+  it('getGitProvenance() reads this repo\'s real git state without throwing', () => {
+    const info = telemetry.getGitProvenance(process.cwd());
+    expect(info.commit_sha === null || /^[0-9a-f]{40}$/.test(info.commit_sha)).toBe(true);
+    expect(typeof info.dirty === 'boolean' || info.dirty === null).toBe(true);
+  });
+
+  it('getGitProvenance() returns all-null shape (not a throw) when git is unavailable', () => {
+    const info = telemetry.getGitProvenance('/definitely/not/a/git/repo/at/all');
+    expect(info).toEqual({ commit_sha: null, dirty: null, dirty_file_count: null, branch: null });
+  });
+
+  it('getDeviceProvenance() never throws and always has node_version', () => {
+    const info = telemetry.getDeviceProvenance();
+    expect(info.node_version).toBe(process.version);
+    // cpu_core_count is null (not 0) on this device -- os.cpus() reads
+    // /proc/stat internally, which is permission-denied here (fact 0.1),
+    // so it returns [] rather than throwing. 0 would be a fabricated
+    // confirmed-zero value; null is the honest one.
+    expect(info.cpu_core_count === null || info.cpu_core_count > 0).toBe(true);
+  });
+
+  it('getRamSwapBytes() reads real /proc/meminfo values on this device', () => {
+    const mem = telemetry.getRamSwapBytes();
+    expect(mem.ram_total_bytes).toBeGreaterThan(0);
+    expect(mem.swap_total_bytes).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('telemetry — T2 env/config allow-list (design §8 item 4, hard constraint 1)', () => {
+  const originalEnv = process.env.AIGENTIK_TELEMETRY;
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.AIGENTIK_TELEMETRY;
+    else process.env.AIGENTIK_TELEMETRY = originalEnv;
+  });
+
+  it('buildEnvOverrides() only ever carries AIGENTIK_TELEMETRY, nothing else from process.env', () => {
+    process.env.AIGENTIK_TELEMETRY = '1';
+    const overrides = telemetry.buildEnvOverrides();
+    expect(Object.keys(overrides)).toEqual(['AIGENTIK_TELEMETRY']);
+    expect(overrides.AIGENTIK_TELEMETRY).toBe('1');
+  });
+
+  it('buildConfigSnapshot() never leaks core_api.token — presence-only boolean', () => {
+    const snapshot = telemetry.buildConfigSnapshot();
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain(config.core_api.token);
+    expect(snapshot.core_api_token_set).toBe(true);
+  });
+
+  it('buildConfigSnapshot() never leaks gmail.app_password — presence-only boolean', () => {
+    const snapshot = telemetry.buildConfigSnapshot();
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain(config.gmail.app_password);
+    expect(snapshot.gmail_app_password_set).toBe(true);
+  });
+
+  it('buildConfigSnapshot() reports presence-only false for unset secrets (gemini/vertex api_key)', () => {
+    const snapshot = telemetry.buildConfigSnapshot();
+    expect(snapshot.gemini_api_key_set).toBe(false);
+    expect(snapshot.vertex_api_key_set).toBe(false);
+  });
+
+  it('buildConfigSnapshot() is a closed projection — every value is a scalar, never a nested sub-object that could smuggle an unreviewed field through', () => {
+    // Note: some allow-listed key NAMES legitimately contain "token"/"key"
+    // as a substring (e.g. "llama.max_tokens" — nothing to do with a
+    // credential), so key-name pattern-matching isn't the right check
+    // here; see the dedicated "never leaks core_api.token" /
+    // "never leaks gmail.app_password" tests above for the actual secret-
+    // value assertions. What this test pins instead: buildConfigSnapshot()
+    // can only ever emit primitive values (string/number/boolean/null),
+    // never a nested object — which would defeat the whole point of an
+    // explicit per-field allow-list by re-introducing a subtree dump.
+    const snapshot = telemetry.buildConfigSnapshot();
+    for (const [key, value] of Object.entries(snapshot)) {
+      if (key === '_policy') continue;
+      expect(value === null || typeof value !== 'object').toBe(true);
+    }
+  });
+
+  it('buildConfigSnapshot() carries the small non-secret projection fields', () => {
+    const snapshot = telemetry.buildConfigSnapshot();
+    expect(snapshot['llm.provider']).toBe(config.llm.provider);
+    expect(snapshot['llama.context_size']).toBe(config.llama.context_size);
+  });
+});
+
+describe('telemetry — T2 model-digest cache', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-digest-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('buildModelEntries() never hashes synchronously — cold cache reports not_computed', () => {
+    const modelFile = path.join(tmpDir, 'fake-model.gguf');
+    fs.writeFileSync(modelFile, Buffer.alloc(10000, 'x'));
+    const cacheFile = path.join(tmpDir, 'model_digests.json');
+
+    const entries = telemetry.buildModelEntries([['primary', modelFile]], cacheFile);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].role).toBe('primary');
+    expect(entries[0].sha256_source).toBe('not_computed');
+    expect(entries[0].sha256).toBeNull();
+    expect(fs.existsSync(cacheFile)).toBe(false); // cache-read only, never created by a cold read
+  });
+
+  it('scheduleColdModelDigests() hashes in the background, caches the result, and does not re-hash on a second buildModelEntries() call', async () => {
+    const modelFile = path.join(tmpDir, 'fake-model.gguf');
+    const contents = Buffer.alloc(50000, 'y');
+    fs.writeFileSync(modelFile, contents);
+    const cacheFile = path.join(tmpDir, 'model_digests.json');
+    const expectedDigest = crypto.createHash('sha256').update(contents).digest('hex');
+
+    const entries = telemetry.buildModelEntries([['primary', modelFile]], cacheFile);
+    expect(entries[0].sha256_source).toBe('not_computed');
+
+    let capturedModels = null;
+    const originalRecordRunStartAmended = telemetry.recordRunStartAmended;
+    // Can't reassign an ESM named export directly; instead assert via the
+    // real emitted JSONL record, which is simpler and exercises the real
+    // path end-to-end (this test also proves the amendment actually
+    // reaches the store, not just that a callback fired).
+    const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-digest-store-'));
+    telemetry.resetForTests();
+    try {
+      const store = telemetry.getStoreForTests(outsideRoot);
+      expect(store).not.toBeNull();
+
+      telemetry.scheduleColdModelDigests({
+        models: entries,
+        runId: store.runId,
+        emitter: 'aigentik',
+        pid: process.pid,
+        cachePath: cacheFile
+      });
+
+      // Poll for the cache file to appear (background hash completing) —
+      // deterministic bound rather than a fixed sleep.
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(cacheFile) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(fs.existsSync(cacheFile)).toBe(true);
+
+      const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      expect(cache[modelFile].sha256).toBe(expectedDigest);
+
+      // Flush the store and confirm a run_start_amended record landed.
+      await store._flush();
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const provenanceFile = path.join(outsideRoot, 'events', dateStr, `provenance.${store.runId}.jsonl`);
+      const lines = fs
+        .readFileSync(provenanceFile, 'utf8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l));
+      const amended = lines.find((r) => r.event_type === 'run_start_amended');
+      expect(amended).toBeDefined();
+      expect(amended.body.models[0].sha256).toBe(expectedDigest);
+      expect(amended.body.models[0].sha256_source).toBe('computed');
+      capturedModels = amended.body.models;
+    } finally {
+      await telemetry.getStoreForTests(outsideRoot)?.shutdown();
+      fs.rmSync(outsideRoot, { recursive: true, force: true });
+      telemetry.resetForTests();
+      void originalRecordRunStartAmended; // referenced only to document the ESM-reassignment constraint above
+    }
+
+    expect(capturedModels).not.toBeNull();
+
+    // Second read must now report "cached", not hash again.
+    const entriesAgain = telemetry.buildModelEntries([['primary', modelFile]], cacheFile);
+    expect(entriesAgain[0].sha256_source).toBe('cached');
+    expect(entriesAgain[0].sha256).toBe(expectedDigest);
+  });
+
+  it('scheduleColdModelDigests() is a no-op (spawns nothing observable) when every entry is already cached', async () => {
+    const modelFile = path.join(tmpDir, 'fake-model.gguf');
+    fs.writeFileSync(modelFile, Buffer.alloc(100, 'z'));
+    const cacheFile = path.join(tmpDir, 'model_digests.json');
+    const stat = fs.statSync(modelFile);
+    fs.writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        [modelFile]: {
+          size_bytes: stat.size,
+          mtime_ns: Math.round(stat.mtimeMs * 1e6),
+          sha256: 'c'.repeat(64),
+          computed_at: 1
+        }
+      })
+    );
+
+    const entries = telemetry.buildModelEntries([['primary', modelFile]], cacheFile);
+    expect(entries[0].sha256_source).toBe('cached');
+
+    const before = fs.statSync(cacheFile).mtimeMs;
+    telemetry.scheduleColdModelDigests({
+      models: entries,
+      runId: 'nocoldrun0000001',
+      emitter: 'aigentik',
+      pid: process.pid,
+      cachePath: cacheFile
+    });
+    await new Promise((r) => setTimeout(r, 300)); // give a would-be background task a chance to fire
+    const after = fs.statSync(cacheFile).mtimeMs;
+    expect(after).toBe(before); // cache file untouched -- nothing was hashed
+  });
+});
+
+describe('telemetry — T2 runs/<run_id>.json (design §3.1)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-runs-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('writeRunProvenanceFile() writes runs/<run_id>.json exactly once and never overwrites it', () => {
+    const first = { run_id: 'samerunidjs00001', body: { marker: 'first' } };
+    const second = { run_id: 'samerunidjs00001', body: { marker: 'second' } };
+    telemetry.writeRunProvenanceFile(first, tmpDir);
+    telemetry.writeRunProvenanceFile(second, tmpDir);
+
+    const onDisk = JSON.parse(fs.readFileSync(path.join(tmpDir, 'runs', 'samerunidjs00001.json'), 'utf8'));
+    expect(onDisk.body.marker).toBe('first');
+  });
+
+  it('writeRunProvenanceFile() never throws on an unwritable path', () => {
+    expect(() => {
+      telemetry.writeRunProvenanceFile({ run_id: 'x', body: {} }, '/definitely/not/writable/at/all');
+    }).not.toThrow();
+  });
+
+  it('recordRunStart() end-to-end: writes runs/<run_id>.json, emits into the JSONL stream, and closes every honest-null the way schema.py\'s validate() would check', async () => {
+    telemetry.resetForTests();
+    const storeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-runstart-store-'));
+    const runsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-runstart-runs-'));
+    try {
+      const store = telemetry.getStoreForTests(storeRoot);
+      expect(store).not.toBeNull();
+
+      telemetry.recordRunStart({
+        emitter: 'aigentik',
+        pid: process.pid,
+        repo: 'Codey-Aigentik',
+        startedTsWall: Date.now() / 1000,
+        runId: store.runId,
+        runsRoot,
+        cachePath: path.join(tmpDir, 'model_digests.json')
+      });
+
+      const runFile = path.join(runsRoot, 'runs', `${store.runId}.json`);
+      expect(fs.existsSync(runFile)).toBe(true);
+      const record = JSON.parse(fs.readFileSync(runFile, 'utf8'));
+      expect(record.category).toBe('provenance');
+      expect(record.event_type).toBe('run_start');
+      expect(record.body.repo).toBe('Codey-Aigentik');
+
+      // Honest-null contract (§2.0.1): every null body field must have a
+      // matching nulls[`body.<field>`] entry.
+      for (const [key, value] of Object.entries(record.body)) {
+        if (value === null) {
+          expect(record.nulls[`body.${key}`]).toBeTruthy();
+        }
+      }
+      expect(record.nulls['body.device_uptime_sec']).toBe('proc_uptime_permission_denied');
+      expect(record.nulls['body.llama_build_info']).toBe('call_site_not_yet_tagged');
+      expect(record.nulls['body.llama_server_argv']).toBe('call_site_not_yet_tagged');
+    } finally {
+      await telemetry.getStoreForTests(storeRoot)?.shutdown();
+      fs.rmSync(storeRoot, { recursive: true, force: true });
+      fs.rmSync(runsRoot, { recursive: true, force: true });
+      telemetry.resetForTests();
+    }
   });
 });
