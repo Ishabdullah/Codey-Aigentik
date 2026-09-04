@@ -218,7 +218,7 @@ async function startLlamaServer() {
     const modelPath = config.llama.model_path.replace(/^~/, process.env.HOME || '/data/data/com.termux/files/home');
     log.info('index', 'Delegating llama-server load to Codey-OS daemon...');
     try {
-      execSync("python3 -c \"import sys; sys.path.insert(0, '/data/data/com.termux/files/home/Codey-OS'); from core.loader_v2 import get_loader; get_loader().ensure_model('primary')\"", { stdio: 'ignore' });
+      execSync("python3 /data/data/com.termux/files/home/Codey-OS/tools/ensure_model_cli.py", { stdio: 'ignore' });
     } catch (e) {
       log.error('index', 'Failed to ask Codey-OS to ensure model', { error: e.message });
     }
