@@ -31,6 +31,7 @@ import * as doNotContact from './do-not-contact.js';
 import * as recruiter from './subcontractor-recruiter.js';
 import * as customerModule from './customer-module.js';
 import * as roleRouter from './role-router.js';
+import { startHttpServer } from './http-server.js';
 
 const CORE_API_BASE_URL = config.core_api?.base_url;
 const CORE_API_TOKEN = config.core_api?.token;
@@ -1659,6 +1660,8 @@ async function main() {
   console.log('\n🤖 Aigentik v' + pkg.version + ' — Starting up...\n');
 
   recordTelemetryRunStart();
+
+  startHttpServer();
 
   await loadProfile();
 
