@@ -1627,6 +1627,24 @@ async function shutdown(signal) {
   log.info('index', signal + ' received — shutting down Aigentik');
   await gmail.disconnect();
   stopLlamaServer();
+  // NEW-325: flush any buffered-but-unwritten telemetry records before
+  // exit. Wrapped defensively like the other telemetry call sites in this
+  // file (recordTelemetryRunStart above) -- a telemetry flush rejecting
+  // must never be able to prevent a graceful shutdown, so any per-write
+  // failure inside shutdownTelemetry() is already caught internally
+  // (telemetry.mjs's _writeBatch). Note this has no explicit timeout: it
+  // only does local fs.promises.appendFile calls (no network), which is
+  // why no bound was added here, but a wedged filesystem could still
+  // stall this await.
+  try {
+    await telemetry.shutdownTelemetry();
+  } catch (exc) {
+    try {
+      log.warn('telemetry', `failed to flush telemetry on shutdown: ${exc}`);
+    } catch {
+      // see other identical guards throughout telemetry.mjs
+    }
+  }
   process.exit(0);
 }
 

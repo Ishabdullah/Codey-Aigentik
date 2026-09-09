@@ -204,6 +204,115 @@ describe('telemetry — pruneOldLogs collision interlock (design §1.4)', () => 
   });
 });
 
+describe('shutdownTelemetry() — NEW-325 process-exit flush hook', () => {
+  it('is a no-op when no store has been instantiated yet', async () => {
+    telemetry.resetForTests();
+    await expect(telemetry.shutdownTelemetry()).resolves.toBeUndefined();
+  });
+
+  it('flushes buffered-but-unwritten records without creating a new store', async () => {
+    telemetry.resetForTests();
+    const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-shutdown-test-'));
+    try {
+      const store = telemetry.getStoreForTests(outsideRoot);
+      expect(store).not.toBeNull();
+
+      const record = telemetry.buildEnvelope({
+        category: 'extraction',
+        eventType: 'grounding_check',
+        emitter: 'aigentik',
+        pid: process.pid,
+        runId: store.runId,
+        body: { field: 'address', outcome: 'passed_numeric_match' }
+      });
+      store.enqueue(record);
+
+      // This is the actual call index.js's signal handler makes on
+      // SIGINT/SIGTERM — exercise it directly rather than store.shutdown().
+      await telemetry.shutdownTelemetry();
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedPath = path.join(outsideRoot, 'events', dateStr, `extraction.${store.runId}.jsonl`);
+      expect(fs.existsSync(expectedPath)).toBe(true);
+      const lines = fs.readFileSync(expectedPath, 'utf8').trim().split('\n');
+      expect(lines.length).toBe(1);
+      expect(JSON.parse(lines[0]).event_type).toBe('grounding_check');
+
+      // Idempotent: calling it again after the store is already stopped
+      // must not throw or re-flush.
+      await expect(telemetry.shutdownTelemetry()).resolves.toBeUndefined();
+    } finally {
+      fs.rmSync(outsideRoot, { recursive: true, force: true });
+      telemetry.resetForTests();
+    }
+  });
+
+  it('does not lose records when shutdown() races an in-flight timer-driven flush', async () => {
+    // Regression test for the race this fix closed: _flush() used to
+    // early-return past an in-flight flush (leaving whatever landed in
+    // the queue afterward unflushed), so shutdown() called concurrently
+    // with a timer-driven flush could resolve before the queue was
+    // actually drained.
+    telemetry.resetForTests();
+    const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'aig-telemetry-race-test-'));
+    try {
+      const store = telemetry.getStoreForTests(outsideRoot);
+      expect(store).not.toBeNull();
+
+      const record1 = telemetry.buildEnvelope({
+        category: 'extraction',
+        eventType: 'grounding_check',
+        emitter: 'aigentik',
+        pid: process.pid,
+        runId: store.runId,
+        body: { field: 'address', outcome: 'passed_numeric_match' }
+      });
+      store.enqueue(record1);
+
+      // Simulate the timer-driven flush already being in flight when the
+      // signal handler fires, and a second record landing in the queue
+      // right as shutdown() calls _flush(). Deliberately do NOT await
+      // inFlightFlush directly (that would mask the bug this test exists
+      // to catch) -- index.js's shutdown() only ever awaits
+      // shutdownTelemetry() -> store.shutdown(), never the timer's own
+      // in-flight _flush() call, so that's the only promise this test
+      // awaits too.
+      const inFlightFlush = store._flush();
+      const record2 = telemetry.buildEnvelope({
+        category: 'extraction',
+        eventType: 'grounding_check',
+        emitter: 'aigentik',
+        pid: process.pid,
+        runId: store.runId,
+        body: { field: 'address', outcome: 'passed_string_match' }
+      });
+      store.enqueue(record2);
+
+      await store.shutdown();
+      // Assert immediately, before letting the in-flight flush's own
+      // promise settle: this is the exact moment index.js's shutdown()
+      // calls process.exit(0) in production, so this is what must already
+      // be true right here, not after some later tick catches up.
+      expect(store._queue.length).toBe(0);
+
+      // Now let the in-flight flush's own promise settle before the test
+      // ends, purely to avoid a dangling-promise warning -- not part of
+      // the assertion above.
+      await inFlightFlush;
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedPath = path.join(outsideRoot, 'events', dateStr, `extraction.${store.runId}.jsonl`);
+      expect(fs.existsSync(expectedPath)).toBe(true);
+      const lines = fs.readFileSync(expectedPath, 'utf8').trim().split('\n').filter(Boolean);
+      const outcomes = lines.map(l => JSON.parse(l).body.outcome);
+      expect(outcomes).toEqual(expect.arrayContaining(['passed_numeric_match', 'passed_string_match']));
+    } finally {
+      fs.rmSync(outsideRoot, { recursive: true, force: true });
+      telemetry.resetForTests();
+    }
+  });
+});
+
 describe('classifyAddressGrounding vs isAddressGrounded (design §2.F four-outcome taxonomy)', () => {
   it('not_applicable_no_value: no address extracted at all', () => {
     expect(llama.classifyAddressGrounding(null, 'some message')).toBe('not_applicable_no_value');

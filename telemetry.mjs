@@ -253,7 +253,13 @@ export class Store {
     this._bytesWritten = 0;
     this._lastDropWarnTs = 0;
     this._stopped = false;
-    this._flushing = false;
+    // Holds the in-flight _drainQueue() promise while a flush is running,
+    // or null when idle. NEW-325: this must be awaitable (not a bare
+    // boolean flag) — shutdown()'s own _flush() call needs to wait out a
+    // timer-driven flush already in progress rather than early-returning
+    // past it, or a flush racing SIGINT/SIGTERM could leave records queued
+    // when process.exit() runs right after shutdown() resolves.
+    this._flushPromise = null;
 
     this._timer = setInterval(() => {
       this._flush().catch(() => {
@@ -325,15 +331,27 @@ export class Store {
   }
 
   async _flush() {
-    if (this._flushing) return; // avoid overlapping timer-driven flushes
-    this._flushing = true;
+    // If a flush is already in progress (timer-driven or otherwise), wait
+    // for it instead of no-op returning past it. A caller that needs the
+    // queue actually drained when this resolves — shutdown() above all —
+    // must not be able to race an in-flight flush and return early while
+    // records are still queued.
+    if (this._flushPromise) {
+      await this._flushPromise;
+      return;
+    }
+    this._flushPromise = this._drainQueue();
     try {
-      while (this._queue.length > 0) {
-        const batch = this._queue.splice(0, this.flushBatch);
-        await this._writeBatch(batch);
-      }
+      await this._flushPromise;
     } finally {
-      this._flushing = false;
+      this._flushPromise = null;
+    }
+  }
+
+  async _drainQueue() {
+    while (this._queue.length > 0) {
+      const batch = this._queue.splice(0, this.flushBatch);
+      await this._writeBatch(batch);
     }
   }
 
@@ -472,6 +490,18 @@ export function resetForTests() {
 
 export function getStoreForTests(rootOverride) {
   return getStore(rootOverride);
+}
+
+// NEW-325: production shutdown hook. Unlike resetForTests(), this must
+// NOT create a store if one was never instantiated (a process that never
+// emitted telemetry shouldn't spin one up just to shut it down), and must
+// NOT null out _singletonStore afterward — shutdown() is idempotent on
+// its own (Store._stopped guard), and the process is exiting right after
+// this resolves anyway.
+export async function shutdownTelemetry() {
+  if (_singletonStore !== null) {
+    await _singletonStore.shutdown();
+  }
 }
 
 // ── generic emit ───────────────────────────────────────────────────────
