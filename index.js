@@ -1665,12 +1665,41 @@ async function main() {
 
   await loadProfile();
 
+  // NEW-419: captured once here rather than re-reading getLlmProvider()
+  // live at each of the two checks below — a config-changing owner
+  // command landing between them (startHttpServer() above is already
+  // live and owner-command.js can call setLlmProvider()) could otherwise
+  // make the load-side check see 'local' and the release-side check(s)
+  // see something else, silently skipping a needed release call for a
+  // model server this process actually caused to spawn.
+  const llmProvider = llama.getLlmProvider();
+
+  // Ask the Codey-OS daemon to release whatever local model server this
+  // process's startLlamaServer() call above caused it to delegate-spawn.
+  // release_model_cli.py is a thin wrapper around the daemon's
+  // already-safe release_model_slot command, which declines on its own
+  // if anything else is legitimately using the model (see that script's
+  // docstring in Codey-OS), so this is safe to call unconditionally from
+  // either early-exit path below.
+  function releaseLocalModelServer() {
+    try {
+      execSync("python3 /data/data/com.termux/files/home/Codey-OS/tools/release_model_cli.py", { stdio: 'ignore' });
+    } catch (e) {
+      log.error('index', 'Failed to ask Codey-OS to release model', { error: e.message });
+    }
+  }
+
   // Only spin up the local llama-server when it's actually the configured
   // provider — a Gemini-only setup has no local model to launch or wait on.
-  if (llama.getLlmProvider() === 'local') {
+  if (llmProvider === 'local') {
     const llamaOk = await startLlamaServer();
     if (!llamaOk) {
       log.error('index', 'Cannot start without llama-server');
+      // NEW-420: startLlamaServer() can fail after its own 30s poll times
+      // out even though the delegated load genuinely spawned a server
+      // that's just slow to answer its health check — release it rather
+      // than leaving it orphaned, same as the warm-up-failure path below.
+      releaseLocalModelServer();
       process.exit(1);
     }
   }
@@ -1678,22 +1707,14 @@ async function main() {
   // Warm up AI (whichever provider is configured)
   const warmedUp = await llama.warmUp();
   if (!warmedUp) {
-    log.error('index', `AI provider (${llama.getLlmProvider()}) not responding`);
+    log.error('index', `AI provider (${llmProvider}) not responding`);
     // NEW-413: if we delegated a real llama-server load to the Codey-OS
     // daemon above (startLlamaServer(), local provider only) and then
     // failed to warm up, we're about to exit without ever using that
     // model server again -- ask the daemon to release it rather than
-    // leaving it orphaned. release_model_cli.py is a thin wrapper around
-    // the daemon's already-safe release_model_slot command, which
-    // declines on its own if anything else is legitimately using the
-    // model (see that script's docstring in Codey-OS), so this is safe
-    // to call unconditionally here.
-    if (llama.getLlmProvider() === 'local') {
-      try {
-        execSync("python3 /data/data/com.termux/files/home/Codey-OS/tools/release_model_cli.py", { stdio: 'ignore' });
-      } catch (e) {
-        log.error('index', 'Failed to ask Codey-OS to release model', { error: e.message });
-      }
+    // leaving it orphaned.
+    if (llmProvider === 'local') {
+      releaseLocalModelServer();
     }
     process.exit(1);
   }
