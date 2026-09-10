@@ -22,14 +22,14 @@ import * as llama from '../llama.js';
 
 // Checked into both repos per design §3.3 ("A test on each side asserts
 // its copy's SHA-256 equals a constant checked into both repos"). Update
-// this together with telemetry/schema/v1.json's own content — never
+// this together with telemetry/schema/v2.json's own content — never
 // change one without the other.
-const EXPECTED_SCHEMA_SHA256_12 = '8a45d9fc8c23';
+const EXPECTED_SCHEMA_SHA256_12 = '13285c51ee6a';
 
 describe('telemetry — schema parity (design §3.3)', () => {
   it("this repo's schema copy hashes to the checked-in constant", () => {
     expect(telemetry.SCHEMA_SHA256_12).toBe(EXPECTED_SCHEMA_SHA256_12);
-    expect(telemetry.SCHEMA_VERSION).toBe(1);
+    expect(telemetry.SCHEMA_VERSION).toBe(2);
   });
 
   it("matches Codey-OS's copy byte-for-byte when both repos are present on this device", () => {
@@ -38,7 +38,31 @@ describe('telemetry — schema parity (design §3.3)', () => {
     // Deliberately NOT a hard dependency — Aigentik must work standalone
     // (§3.3: "Aigentik has no configured path to the Codey-OS tree").
     const codeyOsPath = path.join(
-      path.dirname(path.dirname(process.cwd())),
+      // Sibling checkout: <...>/home/Codey-OS. One dirname off process.cwd()
+      // (<...>/home/Codey-Aigentik) — dirname(dirname(...)) dropped the
+      // home/ segment and made this test skip vacuously on this device.
+      path.dirname(process.cwd()),
+      'Codey-OS',
+      'telemetry',
+      'schema',
+      'v2.json'
+    );
+    if (!fs.existsSync(codeyOsPath)) {
+      return; // Codey-OS checkout not present next to this repo — skip
+    }
+    const ownBytes = fs.readFileSync(path.join(process.cwd(), 'telemetry', 'schema', 'v2.json'));
+    const theirBytes = fs.readFileSync(codeyOsPath);
+    expect(ownBytes.equals(theirBytes)).toBe(true);
+  });
+
+  it("v1.json stays byte-for-byte identical to Codey-OS's frozen copy when both repos are present", () => {
+    // v1.json is frozen forever in both repos (historical records still
+    // reference its hash) — nothing else guards that it stays identical.
+    const codeyOsPath = path.join(
+      // Sibling checkout: <...>/home/Codey-OS. One dirname off process.cwd()
+      // (<...>/home/Codey-Aigentik) — dirname(dirname(...)) dropped the
+      // home/ segment and made this test skip vacuously on this device.
+      path.dirname(process.cwd()),
       'Codey-OS',
       'telemetry',
       'schema',

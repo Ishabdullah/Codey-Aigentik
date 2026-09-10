@@ -4,7 +4,7 @@
 // ~/Codey-OS/telemetry/{envelope,store,schema,recorders}.py for the
 // Python-side counterpart this module is written to match record-for-
 // record: same envelope shape, same schema file (byte-identical copy at
-// telemetry/schema/v1.json), same JSONL layout under the SAME store root
+// telemetry/schema/v2.json), same JSONL layout under the SAME store root
 // (~/.codeyOS/metrics/) so both languages' records interleave into one
 // dataset.
 //
@@ -33,7 +33,7 @@ import config from './config.json' with { type: 'json' };
 import log from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = path.join(__dirname, 'telemetry', 'schema', 'v1.json');
+const SCHEMA_PATH = path.join(__dirname, 'telemetry', 'schema', 'v2.json');
 
 // Read the schema file as raw bytes for hashing — NOT via
 // `import ... with { type: 'json' }`. That syntax hands back a re-
