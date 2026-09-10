@@ -114,12 +114,30 @@ const SIGNATURE_ICON_CID = 'restoricon-icon';
 // Builds the AI's email sign-off in both plain-text and HTML form. Kept
 // distinct from the owner's own signature by always identifying as the
 // agent (never the owner's personal name) once a business is configured.
-function buildEmailSignature(agentName, businessName, ownerName, taglineText) {
+function buildEmailSignature(agentName, businessName, ownerName, taglineText, contact = {}) {
   const identity = businessName
     ? `${agentName} | ${businessName}`
     : `${agentName} | Personal Agent of ${ownerName}`;
 
-  const text = `\n\n---\n${identity}` + (taglineText ? `\n${taglineText}` : '');
+  // Collapse any CR/LF in these dashboard-typed values so a pasted
+  // multi-line value can't inject extra apparent signature lines.
+  const clean = (v) => (v || '').toString().replace(/[\r\n]+/g, ' ').trim();
+  const phone = clean(contact.phone);
+  const email = clean(contact.email);
+  const license = clean(contact.license);
+  const has = (v) => v.length > 0;
+
+  let contactText = '';
+  if (has(phone)) contactText += `\nPhone: ${phone}`;
+  if (has(email)) contactText += `\n${email}`;
+  if (has(license)) contactText += `\nCT Lic. #${license}`;
+
+  const text = `\n\n---\n${identity}` + (taglineText ? `\n${taglineText}` : '') + contactText;
+
+  let contactHtml = '';
+  if (has(phone)) contactHtml += `<br><span style="color:#666;">Phone: ${escapeHtml(phone)}</span>`;
+  if (has(email)) contactHtml += `<br><span style="color:#666;">${escapeHtml(email)}</span>`;
+  if (has(license)) contactHtml += `<br><span style="color:#666;">CT Lic. #${escapeHtml(license)}</span>`;
 
   const html = '<br><br>' +
     '<table role="presentation" cellpadding="0" cellspacing="0" style="border-top:1px solid #ccc;padding-top:10px;">' +
@@ -128,11 +146,24 @@ function buildEmailSignature(agentName, businessName, ownerName, taglineText) {
     '<td style="font-family:Arial,sans-serif;font-size:13px;color:#333;vertical-align:middle;">' +
     `<strong>${identity}</strong>` +
     (taglineText ? `<br><span style="color:#666;">${taglineText}</span>` : '') +
+    contactHtml +
     '</td>' +
     '</tr>' +
     '</table>';
 
   return { text, html };
+}
+
+// Pulls the dashboard-set business contact fields (phone / support email /
+// license number) out of config for the buildEmailSignature 5th arg. Kept
+// separate from buildEmailSignature so that function stays pure and
+// unit-testable without a config.
+function businessContactFromConfig() {
+  return {
+    phone: config.business_phone,
+    email: config.business_email,
+    license: config.license_number
+  };
 }
 
 function escapeHtml(str) {
@@ -346,7 +377,7 @@ async function generateEmailReply(senderName, senderEmail, subject, body, relati
   const tagline = businessName
     ? 'For anything urgent, reply back with the word "urgent" and we\'ll get back to you as soon as possible.'
     : 'If you need to reach ' + owner + ' urgently, include "' + owner + '" in your subject line.';
-  const signature = buildEmailSignature(agent, businessName, owner, tagline);
+  const signature = buildEmailSignature(agent, businessName, owner, tagline, businessContactFromConfig());
 
   let instructionText = '';
   if (contactInstructions) {
@@ -801,7 +832,8 @@ async function generateRecruiterReply({
       agent,
       busName,
       owner,
-      'Building our qualified subcontractor network ahead of our planned January 2027 ramp-up.'
+      'Building our qualified subcontractor network ahead of our planned January 2027 ramp-up.',
+      businessContactFromConfig()
     );
     return {
       text: rawReply + signature.text,
@@ -873,7 +905,8 @@ async function generateCustomerReply({
       agent,
       busName,
       owner,
-      'Residential remodeling, restoration, repair, and general contracting across Connecticut.'
+      'Residential remodeling, restoration, repair, and general contracting across Connecticut.',
+      businessContactFromConfig()
     );
     return {
       text: rawReply + signature.text,
@@ -1043,6 +1076,7 @@ export {
   setLlmProvider,
   classifySchedulingIntent,
   buildEmailSignature,
+  businessContactFromConfig,
   textToHtml,
   SIGNATURE_ICON_PATH,
   SIGNATURE_ICON_CID,

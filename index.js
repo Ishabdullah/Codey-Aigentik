@@ -172,6 +172,9 @@ async function loadProfile() {
       owner_name: null,
       business_name: null,
       business_description: null,
+      business_phone: null,
+      business_email: null,
+      license_number: null,
       onboarding_sent: false
     };
   }
@@ -187,6 +190,9 @@ async function loadProfile() {
   config.owner_name = profile.owner_name || null;
   config.business_name = profile.business_name || null;
   config.business_description = profile.business_description || null;
+  config.business_phone = profile.business_phone || null;
+  config.business_email = profile.business_email || null;
+  config.license_number = profile.license_number || null;
   return profile;
 }
 
@@ -889,7 +895,7 @@ async function handleSubcontractorApplication(email) {
       parsed.trade_raw || parsed.trade,
       agentName, businessName, businessDescription
     );
-    const signature = llama.buildEmailSignature(agentName, businessName, ownerName, null);
+    const signature = llama.buildEmailSignature(agentName, businessName, ownerName, null, llama.businessContactFromConfig());
     await gmail.sendReply(
       email.from_email,
       email.subject,

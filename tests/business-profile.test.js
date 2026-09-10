@@ -35,6 +35,9 @@ describe('business-profile (Core write-through)', () => {
     config.owner_name = null;
     config.business_name = null;
     config.business_description = null;
+    config.business_phone = null;
+    config.business_email = null;
+    config.license_number = null;
     // Write fresh default profile to profile.json
     const fresh = {
       configured: false,
@@ -44,6 +47,9 @@ describe('business-profile (Core write-through)', () => {
       owner_name: null,
       business_name: null,
       business_description: null,
+      business_phone: null,
+      business_email: null,
+      license_number: null,
       onboarding_sent: false
     };
     fs.writeFileSync(profilePath, JSON.stringify(fresh, null, 2));
@@ -70,6 +76,9 @@ describe('business-profile (Core write-through)', () => {
         owner_name: 'Bob',
         business_name: 'Bob Renovations LLC',
         business_description: 'Residential remodeling',
+        business_phone: '860-555-0100',
+        business_email: 'support@bobreno.com',
+        license_number: 'HIC.0600000',
         configured: 1,
         agent_name_set: 1,
         onboarding_sent: 1
@@ -87,6 +96,9 @@ describe('business-profile (Core write-through)', () => {
       expect(config.owner_name).toBe('Bob');
       expect(config.business_name).toBe('Bob Renovations LLC');
       expect(config.business_description).toBe('Residential remodeling');
+      expect(config.business_phone).toBe('860-555-0100');
+      expect(config.business_email).toBe('support@bobreno.com');
+      expect(config.license_number).toBe('HIC.0600000');
       expect(profile.aigentik_name).toBe('Jarvis');
     });
 
@@ -96,6 +108,9 @@ describe('business-profile (Core write-through)', () => {
       const profile = await loadProfile();
       expect(profile).toBeDefined();
       expect(config.aigentik_name).toBe('Aigentik');
+      expect(config.business_phone).toBeNull();
+      expect(config.business_email).toBeNull();
+      expect(config.license_number).toBeNull();
     });
 
     it('falls back gracefully when Core API request fails with network error', async () => {
@@ -104,6 +119,9 @@ describe('business-profile (Core write-through)', () => {
       const profile = await loadProfile();
       expect(profile).toBeDefined();
       expect(config.aigentik_name).toBe('Aigentik');
+      expect(config.business_phone).toBeNull();
+      expect(config.business_email).toBeNull();
+      expect(config.license_number).toBeNull();
     });
   });
 
@@ -184,6 +202,9 @@ describe('business-profile (Core write-through)', () => {
         owner_name: null,
         business_name: null,
         business_description: null,
+        business_phone: '860-555-0100',
+        business_email: 'support@restoricon.com',
+        license_number: 'HIC.0600000',
         onboarding_sent: 0,
         setup_date: '2026-01-01T00:00:00.000Z',
         updated_at: '2026-01-02T00:00:00.000Z',
@@ -216,6 +237,11 @@ describe('business-profile (Core write-through)', () => {
       expect(body.business_name).toBe('FromCoreBiz');
       expect(body.aigentik_name).toBe('Newname');
       expect(body.agent_name_set).toBe(1);
+      // Round-trip guard: the dashboard-set contact fields present in the
+      // Core-fresh profile survive into the write-back POST body untouched.
+      expect(body.business_phone).toBe('860-555-0100');
+      expect(body.business_email).toBe('support@restoricon.com');
+      expect(body.license_number).toBe('HIC.0600000');
       // config refreshed from the POST response, not from local disk
       expect(config.aigentik_name).toBe('Newname');
       expect(config.business_name).toBe('FromCoreBiz');
