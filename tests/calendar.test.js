@@ -173,6 +173,193 @@ describe('parseDatetimePhrase', () => {
   });
 });
 
+describe('effectiveHoursForType', () => {
+  const businessHours = {
+    mon: { start: '08:00', end: '18:00' },
+    tue: { start: '08:00', end: '18:00' },
+    wed: null // business closed Wednesdays
+  };
+
+  it('empty type hours ({}) inherits the business day unchanged', () => {
+    expect(calendar.effectiveHoursForType(businessHours, {}, 'mon')).toEqual({ start: '08:00', end: '18:00' });
+  });
+
+  it('undefined type hours also inherits the business day unchanged', () => {
+    expect(calendar.effectiveHoursForType(businessHours, undefined, 'mon')).toEqual({ start: '08:00', end: '18:00' });
+  });
+
+  it('an explicit day in a non-empty grid wins and is intersected with business hours', () => {
+    const typeHours = { mon: { start: '10:00', end: '16:00' } };
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'mon')).toEqual({ start: '10:00', end: '16:00' });
+  });
+
+  it('an explicit null day in a non-empty grid means closed for the type that day', () => {
+    const typeHours = { mon: { start: '10:00', end: '16:00' }, tue: null };
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'tue')).toBeNull();
+  });
+
+  it('a non-empty grid with the day absent is treated as "not offered that day" (chosen interpretation)', () => {
+    const typeHours = { tue: { start: '10:00', end: '16:00' } }; // mon absent
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'mon')).toBeNull();
+  });
+
+  it('narrows correctly when the type window only partially overlaps business hours', () => {
+    const typeHours = { mon: { start: '06:00', end: '11:00' } }; // starts before business opens
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'mon')).toEqual({ start: '08:00', end: '11:00' });
+  });
+
+  it('returns closed when the intersection inverts (type window entirely outside business hours)', () => {
+    const typeHours = { mon: { start: '19:00', end: '20:00' } }; // after business closes at 18:00
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'mon')).toBeNull();
+  });
+
+  it('business closed that day beats a type window that claims to be open', () => {
+    const typeHours = { wed: { start: '10:00', end: '12:00' } };
+    expect(calendar.effectiveHoursForType(businessHours, typeHours, 'wed')).toBeNull();
+  });
+});
+
+describe('hasConflict — capacity (Final scheduling round Phase 6)', () => {
+  const start = new Date('2026-09-14T10:00:00');
+  const end = new Date('2026-09-14T10:30:00');
+  const bufferMinutes = 15;
+
+  describe('no appointmentType (null/undefined) — legacy fail-closed any-type cap-1', () => {
+    it('conflicts with an overlapping confirmed appointment of ANY type', () => {
+      const appts = [
+        { id: 'a1', status: 'confirmed', appointment_type_id: 99, start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' }
+      ];
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null)).toBe(true);
+    });
+
+    it('does not conflict when nothing overlaps', () => {
+      const appts = [
+        { id: 'a1', status: 'confirmed', start: '2026-09-14T14:00:00', end: '2026-09-14T14:30:00' }
+      ];
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null)).toBe(false);
+    });
+
+    it('ignores non-confirmed statuses', () => {
+      const appts = [
+        { id: 'a1', status: 'negotiating', start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' },
+        { id: 'a2', status: 'cancelled', start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' }
+      ];
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null)).toBe(false);
+    });
+  });
+
+  describe('appointmentType given — same-type-only capacity cap', () => {
+    const typeA = { id: 1, max_concurrent: 2 };
+    const typeB = { id: 2, max_concurrent: 2 };
+
+    it('allows up to max_concurrent overlapping confirmed same-type appointments', () => {
+      const oneExisting = [
+        { id: 'a1', status: 'confirmed', appointment_type_id: 1, start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' }
+      ];
+      expect(calendar.hasConflict(start, end, oneExisting, bufferMinutes, null, typeA)).toBe(false);
+
+      const twoExisting = [
+        ...oneExisting,
+        { id: 'a2', status: 'confirmed', appointment_type_id: 1, start: '2026-09-14T10:10:00', end: '2026-09-14T10:40:00' }
+      ];
+      expect(calendar.hasConflict(start, end, twoExisting, bufferMinutes, null, typeA)).toBe(true);
+    });
+
+    it('different types do not interact', () => {
+      const appts = [
+        { id: 'a1', status: 'confirmed', appointment_type_id: 2, start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' },
+        { id: 'a2', status: 'confirmed', appointment_type_id: 2, start: '2026-09-14T10:10:00', end: '2026-09-14T10:40:00' }
+      ];
+      // Both existing are type 2 (at its own cap), but we're checking type 1's availability
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null, typeA)).toBe(false);
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null, typeB)).toBe(true);
+    });
+
+    it('excludes negotiating/cancelled same-type rows from the count, matching Core', () => {
+      const appts = [
+        { id: 'a1', status: 'negotiating', appointment_type_id: 1, start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' },
+        { id: 'a2', status: 'cancelled', appointment_type_id: 1, start: '2026-09-14T10:10:00', end: '2026-09-14T10:40:00' }
+      ];
+      expect(calendar.hasConflict(start, end, appts, bufferMinutes, null, typeA)).toBe(false);
+    });
+
+    it('defaults max_concurrent to 1 when the type row omits it', () => {
+      const typeNoCap = { id: 3 };
+      const oneExisting = [
+        { id: 'a1', status: 'confirmed', appointment_type_id: 3, start: '2026-09-14T10:15:00', end: '2026-09-14T10:45:00' }
+      ];
+      expect(calendar.hasConflict(start, end, oneExisting, bufferMinutes, null, typeNoCap)).toBe(true);
+    });
+
+    it('buffer parity: same boundary behavior as the untyped case', () => {
+      const type1 = { id: 1, max_concurrent: 1 };
+      // Existing ends at 10:30, buffer 15min -> buffered end 10:45. A new
+      // slot starting exactly at 10:45 should NOT conflict (matches the
+      // untyped hasConflict's own boundary math: start.getTime() < aEnd).
+      const appts = [
+        { id: 'a1', status: 'confirmed', appointment_type_id: 1, start: '2026-09-14T09:30:00', end: '2026-09-14T10:30:00' }
+      ];
+      const adjacentStart = new Date('2026-09-14T10:45:00');
+      const adjacentEnd = new Date('2026-09-14T11:15:00');
+      expect(calendar.hasConflict(adjacentStart, adjacentEnd, appts, bufferMinutes, null, type1)).toBe(false);
+      // One minute earlier still falls inside the buffer -> conflict.
+      const withinBufferStart = new Date('2026-09-14T10:44:00');
+      const withinBufferEnd = new Date('2026-09-14T11:14:00');
+      expect(calendar.hasConflict(withinBufferStart, withinBufferEnd, appts, bufferMinutes, null, type1)).toBe(true);
+    });
+
+    it('exercises the same predicate against appointments produced by mapCoreToJS (end-to-end field-name wiring)', () => {
+      const coreRow = {
+        id: 55, external_id: 'appt_55', status: 'confirmed',
+        start_time: '2026-09-14T10:15:00.000Z', end_time: '2026-09-14T10:45:00.000Z',
+        appointment_type_id: 1
+      };
+      const jsAppt = calendar.mapCoreToJS(coreRow);
+      expect(jsAppt.appointment_type_id).toBe(1); // wiring check, not just behavior
+      const capOneType = { id: 1, max_concurrent: 1 };
+      const utcStart = new Date('2026-09-14T10:00:00.000Z');
+      const utcEnd = new Date('2026-09-14T10:30:00.000Z');
+      expect(calendar.hasConflict(utcStart, utcEnd, [jsAppt], bufferMinutes, null, capOneType)).toBe(true);
+    });
+  });
+});
+
+describe('isSlotAvailable — hours + capacity combined', () => {
+  const scheduleConfig = {
+    working_hours: { mon: { start: '09:00', end: '17:00' } },
+    buffer_minutes: 15
+  };
+
+  it('rejects a slot outside the type-narrowed hours even though business hours would allow it', () => {
+    const type = { id: 1, max_concurrent: 5, scheduling_hours: { mon: { start: '09:00', end: '11:00' } } };
+    const start = new Date('2026-09-14T12:00:00'); // a Monday
+    const end = new Date('2026-09-14T12:30:00');
+    expect(calendar.isSlotAvailable(start, end, scheduleConfig, [], null, type)).toBe(false);
+  });
+
+  it('accepts a slot within the type-narrowed hours', () => {
+    const type = { id: 1, max_concurrent: 5, scheduling_hours: { mon: { start: '09:00', end: '11:00' } } };
+    const start = new Date('2026-09-14T09:30:00');
+    const end = new Date('2026-09-14T10:00:00');
+    expect(calendar.isSlotAvailable(start, end, scheduleConfig, [], null, type)).toBe(true);
+  });
+});
+
+describe('mapCoreToJS & mapJSToCore — appointment_type_id round trip', () => {
+  it('maps appointment_type_id both directions', () => {
+    const core = { id: 1, external_id: 'appt_1', appointment_type_id: 7 };
+    const js = calendar.mapCoreToJS(core);
+    expect(js.appointment_type_id).toBe(7);
+    const backToCore = calendar.mapJSToCore(js);
+    expect(backToCore.appointment_type_id).toBe(7);
+  });
+
+  it('defaults to null when absent on either side', () => {
+    expect(calendar.mapCoreToJS({ id: 1, external_id: 'appt_1' }).appointment_type_id).toBeNull();
+    expect(calendar.mapJSToCore({ id: 'appt_1' }).appointment_type_id).toBeNull();
+  });
+});
+
 describe('calendar (Core write-through)', () => {
   let fetchSpy;
 
@@ -249,6 +436,26 @@ describe('calendar (Core write-through)', () => {
       expect(appts).toHaveLength(1);
       expect(appts[0].id).toBe('appt_1');
       expect(appts[0]._core_id).toBe(1);
+    });
+
+    it('loadAppointmentTypes fetches the array from Core', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(200, {
+        appointment_types: [{ id: 1, name: 'Estimate', active: 1, max_concurrent: 2, scheduling_hours: {} }]
+      }));
+      const types = await calendar.loadAppointmentTypes();
+      expect(fetchSpy.mock.calls[0][0].pathname).toBe('/api/v1/appointment-types');
+      expect(types).toHaveLength(1);
+      expect(types[0].name).toBe('Estimate');
+    });
+
+    it('loadAppointmentTypes returns [] on a Core failure, does not throw', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(500, { error: 'boom' }));
+      await expect(calendar.loadAppointmentTypes()).resolves.toEqual([]);
+    });
+
+    it('loadAppointmentTypes returns [] on a network failure, does not throw', async () => {
+      fetchSpy.mockRejectedValue(new Error('network down'));
+      await expect(calendar.loadAppointmentTypes()).resolves.toEqual([]);
     });
 
     it('fetches schedule config from Core API or falls back to defaults on 404', async () => {
@@ -393,6 +600,31 @@ describe('calendar (Core write-through)', () => {
       expect(proposed.status).toBe('negotiating');
       expect(proposed.offered_slots).toHaveLength(1);
     });
+
+    it('createAppointment tags a Core 400 (capacity rejection) onto the thrown error as .status (NEW-467)', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(400, {
+        error: 'Booking would exceed the concurrency cap (1) for this appointment type in the requested time window'
+      }));
+      let caught = null;
+      try {
+        await calendar.createAppointment({ title: 'X', start: '2026-09-14T10:00:00.000Z', end: '2026-09-14T10:30:00.000Z' });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught.status).toBe(400);
+    });
+
+    it('createAppointment tags a 500 as .status too (so callers can distinguish 400 from everything else)', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(500, { error: 'internal error' }));
+      let caught = null;
+      try {
+        await calendar.createAppointment({ title: 'X', start: '2026-09-14T10:00:00.000Z', end: '2026-09-14T10:30:00.000Z' });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught.status).toBe(500);
+    });
   });
 
   describe('updateAppointment / reschedule / cancel', () => {
@@ -499,6 +731,27 @@ describe('calendar (Core write-through)', () => {
       expect(cancelled.status).toBe('cancelled');
       expect(fetchSpy.mock.calls[1][0].pathname).toBe('/api/v1/appointments/12/update');
     });
+
+    it('confirmNegotiation propagates a Core 400 (capacity rejection) with .status set (NEW-467)', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(mockResponse(200, {
+          appointments: [
+            { id: 20, external_id: 'appt_20', title: 'Negotiation', status: 'negotiating', appointment_type_id: 1 }
+          ]
+        }))
+        .mockResolvedValueOnce(mockResponse(400, {
+          error: 'Booking would exceed the concurrency cap (1) for this appointment type in the requested time window'
+        }));
+
+      let caught = null;
+      try {
+        await calendar.confirmNegotiation('appt_20', '2026-09-14T10:00:00.000Z', '2026-09-14T10:30:00.000Z', 'x@example.com');
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught.status).toBe(400);
+    });
   });
 
   describe('findNextAvailableSlot', () => {
@@ -572,6 +825,79 @@ describe('calendar (Core write-through)', () => {
       expect(slot.start.getMinutes()).toBe(30);
       expect(slot.end.getHours()).toBe(12);
       expect(slot.end.getMinutes()).toBe(0);
+    });
+  });
+
+  describe('generateOfferSlots — appointmentTypeId end-to-end (resolution + hours + cap)', () => {
+    // Exercises the FULL production path in one test: appointmentTypeId ->
+    // resolveAppointmentType -> loadAppointmentTypes() Core fetch -> type
+    // lookup by id -> threaded into findNextAvailableSlot -> isSlotAvailable
+    // -> effectiveHoursForType + hasConflict's capacity branch. Every other
+    // test above passes a pre-resolved type object directly, which proves
+    // the hours/cap MATH is right but not that a real appointmentTypeId
+    // actually resolves and reaches it (the exact class of wiring gap
+    // NEW-259 was).
+    it('offers avoid a same-type capped window and stay inside the type-narrowed hours', async () => {
+      // 2026-08-31 is a Monday. Business hours: Mon 09:00-17:00. The type
+      // narrows Monday to 10:00-12:00 and caps at 1 concurrent — an existing
+      // confirmed same-type appointment 10:00-10:30 (+15min buffer either
+      // side) occupies the type's cap through 10:45.
+      fetchSpy.mockImplementation(async (url, init = {}) => {
+        const method = init.method || 'GET';
+        const pathname = url.pathname;
+        if (pathname === '/api/v1/appointment-types' && method === 'GET') {
+          return mockResponse(200, {
+            appointment_types: [
+              { id: 1, name: 'Consultation', active: 1, max_concurrent: 1, scheduling_hours: { mon: { start: '10:00', end: '12:00' } } }
+            ]
+          });
+        }
+        if (pathname === '/api/v1/schedule-config' && method === 'GET') {
+          return mockResponse(200, {
+            schedule_config: {
+              working_hours: { mon: { start: '09:00', end: '17:00' } },
+              buffer_minutes: 15,
+              default_duration_minutes: 30,
+              booking_window_days: 30
+            }
+          });
+        }
+        if (pathname === '/api/v1/appointments' && method === 'GET') {
+          return mockResponse(200, {
+            appointments: [
+              {
+                id: 1, external_id: 'appt_1', status: 'confirmed', appointment_type_id: 1,
+                // Local wall-clock 10:00-10:30 on 2026-08-31, stored as the
+                // ISO string loadCalendar would actually hand back (same
+                // pattern the rest of this file uses: `new Date(...).toISOString()`
+                // rather than a hand-typed "Z" literal, so this test is
+                // timezone-independent).
+                start_time: new Date('2026-08-31T10:00:00').toISOString(),
+                end_time: new Date('2026-08-31T10:30:00').toISOString()
+              }
+            ]
+          });
+        }
+        return mockResponse(404, { error: `unhandled in test mock: ${method} ${pathname}` });
+      });
+
+      const afterDate = new Date('2026-08-31T00:00:00');
+      const offers = await calendar.generateOfferSlots({
+        durationMinutes: 30, afterDate, count: 2, appointmentTypeId: 1
+      });
+
+      expect(offers).toHaveLength(2);
+      // Both offers land after the buffered-cap window (10:45) and inside
+      // the type's 10:00-12:00 narrowed hours -- neither the raw business
+      // hours (09:00-17:00) nor "no cap at all" would produce this result.
+      expect(offers[0].start.getHours()).toBe(10);
+      expect(offers[0].start.getMinutes()).toBe(45);
+      expect(offers[0].end.getHours()).toBe(11);
+      expect(offers[0].end.getMinutes()).toBe(15);
+      expect(offers[1].start.getHours()).toBe(11);
+      expect(offers[1].start.getMinutes()).toBe(30);
+      expect(offers[1].end.getHours()).toBe(12);
+      expect(offers[1].end.getMinutes()).toBe(0);
     });
   });
 });

@@ -85,6 +85,7 @@ function mapCoreToJS(core) {
     attendee_name: core.attendee_name || null,
     attendee_email: core.attendee_email || null,
     appointment_type: core.appointment_type || null,
+    appointment_type_id: core.appointment_type_id ?? null,
     status: core.status || 'confirmed',
     rsvp_status: core.rsvp_status || 'pending',
     pending_reschedule: core.pending_reschedule || null,
@@ -112,6 +113,7 @@ function mapJSToCore(js) {
     attendee_name: js.attendee_name || null,
     attendee_email: js.attendee_email || null,
     appointment_type: js.appointment_type || null,
+    appointment_type_id: js.appointment_type_id ?? null,
     status: js.status || 'confirmed',
     rsvp_status: js.rsvp_status || 'pending',
     pending_reschedule: js.pending_reschedule || null,
@@ -134,6 +136,39 @@ async function loadCalendar() {
   });
   if (!ok) throw new Error(`Core appointments list failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
   return (data.appointments || []).map(mapCoreToJS);
+}
+
+// Final scheduling round Phase 6: appointment TYPES (the "Estimate" /
+// "Consultation" service-type axis, distinct from the call/in_person
+// modality) are dashboard-authored and Core-only this round — calendar.js
+// only reads them, never writes /api/v1/appointment-types. Unlike
+// loadCalendar/loadScheduleConfig, this is a SECONDARY data source for
+// slot-offering (business hours + the schedule itself remain primary), so
+// a Core failure degrades to "no type-specific constraint" (empty array)
+// rather than throwing and taking down the whole slot-offering path.
+async function loadAppointmentTypes() {
+  try {
+    const { ok, status, data } = await coreRequest('GET', '/api/v1/appointment-types');
+    if (!ok) {
+      log.warn('calendar', 'Could not load appointment types from Core', { status });
+      return [];
+    }
+    return data.appointment_types || [];
+  } catch (e) {
+    log.warn('calendar', 'Could not load appointment types from Core', { error: e.message });
+    return [];
+  }
+}
+
+// Resolves an appointment_type_id to its full type row (for max_concurrent/
+// scheduling_hours), or null when the id is absent OR doesn't resolve to a
+// row (deleted/stale reference) — both cases are treated identically by
+// every caller downstream (see hasConflict/effectiveHoursForType), since
+// neither carries any per-type constraint to enforce.
+async function resolveAppointmentType(appointmentTypeId, appointmentTypes) {
+  if (appointmentTypeId === null || appointmentTypeId === undefined) return null;
+  const types = appointmentTypes || await loadAppointmentTypes();
+  return types.find(t => t.id === appointmentTypeId) || null;
 }
 
 // Deep-merge Core's working_hours over DEFAULT_SCHEDULE_CONFIG.working_hours,
@@ -367,35 +402,132 @@ function fitsWorkingHours(start, end, dayHours) {
   return start >= dayStart && end <= dayEnd;
 }
 
-function hasConflict(start, end, appointments, bufferMinutes, excludeId) {
+// Narrows a Business Hours day window by a per-type scheduling_hours day
+// window; a type can never be MORE available than the business is open.
+// String comparison is safe here ONLY because both sides are guaranteed
+// zero-padded 24h "HH:MM": Business Hours values come from
+// parseWorkingHoursPhrase's to24h() (explicit padStart(2,'0')), and
+// per-type scheduling_hours values come from the dashboard's
+// <input type="time"> fields (api/web_surfaces.py) — HTML5 guarantees a
+// time input's .value is always zero-padded 24h "HH:MM", never "9:00".
+// Verified against the actual dashboard markup, not assumed from the
+// Business Hours convention (rule 12) — if that ever changes to a
+// free-text field, this needs to switch to a numeric hh*60+mm comparison.
+function intersectHours(a, b) {
+  if (!a || !b) return null;
+  const start = a.start > b.start ? a.start : b.start;
+  const end = a.end < b.end ? a.end : b.end;
+  if (start >= end) return null;
+  return { start, end };
+}
+
+// Final scheduling round Phase 6: businessWorkingHours ∩ per-type
+// scheduling_hours for one weekday.
+// - typeSchedulingHours empty/absent (or the type didn't resolve at all —
+//   see resolveAppointmentType) -> inherit the business day unchanged.
+//   Matches restoricon_core/models.py's AppointmentType docstring: an
+//   all-empty {} means "inherit business hours," not "never available."
+// - typeSchedulingHours non-empty and this exact day key is present
+//   (including an explicit `null` = closed that day for this type) -> that
+//   value wins, then gets intersected with the business day.
+// - typeSchedulingHours non-empty but this day key is ABSENT: the model's
+//   docstring only defines the all-empty case, so this is genuinely
+//   ambiguous. Chosen interpretation: an author who populated specific
+//   days meant to scope the type to only those days (e.g. Tue/Thu-only
+//   Consultations), so an absent day means "not offered," not "inherit."
+//   This is the conservative reading — Core doesn't enforce
+//   scheduling_hours server-side at all (F3), calendar.js is the only
+//   place it's checked, so under-offering here is recoverable (customer
+//   just doesn't see that day) while over-offering isn't (customer picks
+//   a day the type author never intended to be available).
+function effectiveHoursForType(businessWorkingHours, typeSchedulingHours, dayKey) {
+  const businessDay = businessWorkingHours?.[dayKey] || null;
+  const hasType = typeSchedulingHours && typeof typeSchedulingHours === 'object' &&
+    Object.keys(typeSchedulingHours).length > 0;
+  if (!hasType) return businessDay;
+  if (!Object.prototype.hasOwnProperty.call(typeSchedulingHours, dayKey)) return null;
+  const typeDay = typeSchedulingHours[dayKey];
+  if (!typeDay || !businessDay) return null;
+  return intersectHours(businessDay, typeDay);
+}
+
+// `appointmentType` is the resolved AppointmentType row (or null/undefined
+// when no type constraint applies — see resolveAppointmentType). Falsy
+// covers BOTH "no type was ever requested" (existing call sites, untouched
+// behavior) and "a type id was given but didn't resolve" (stale/deleted
+// reference) identically on purpose.
+function hasConflict(start, end, appointments, bufferMinutes, excludeId, appointmentType) {
   const bufferMs = bufferMinutes * 60 * 1000;
-  return appointments.some(a => {
-    if (a.status !== 'confirmed') return false;
-    if (excludeId && (a.id === excludeId || a._core_id === excludeId)) return false;
+  const overlapsBuffered = (a) => {
     const aStart = new Date(a.start).getTime() - bufferMs;
     const aEnd = new Date(a.end).getTime() + bufferMs;
     return start.getTime() < aEnd && end.getTime() > aStart;
-  });
+  };
+
+  if (!appointmentType) {
+    // Legacy fail-CLOSED any-type cap-1 check (unchanged from before this
+    // round — every existing caller that doesn't pass a type keeps this
+    // exact behavior). Deliberately asymmetric with Core's fail-OPEN rule
+    // for a missing/absent appointment_type_id
+    // (services/scheduling_service.py's _assert_within_concurrency_cap):
+    // Core's check is a server-side final gate with nothing upstream of
+    // it, so failing open there just means "no cap configured, allow it."
+    // calendar.js's check only decides which slots to ADVISE offering —
+    // failing closed here can only make it offer fewer slots than Core
+    // would ultimately accept, never more, whereas failing open could
+    // offer a slot Core later rejects with a 400 (the exact case NEW-467's
+    // graceful handling exists for, but still better avoided than relied
+    // on).
+    return appointments.some(a => {
+      if (a.status !== 'confirmed') return false;
+      if (excludeId && (a.id === excludeId || a._core_id === excludeId)) return false;
+      return overlapsBuffered(a);
+    });
+  }
+
+  // Same-type-only capacity cap — byte-for-byte parity with Core's
+  // _assert_within_concurrency_cap: same buffer-expand-existing-only
+  // overlap predicate, same status === 'confirmed' filter (negotiating/
+  // cancelled excluded from the count), same count >= max_concurrent
+  // threshold. `active` on the type is deliberately not checked, matching
+  // Core — a deactivated type still enforces whatever cap it last had.
+  const cap = appointmentType.max_concurrent ?? 1;
+  let count = 0;
+  for (const a of appointments) {
+    if (a.status !== 'confirmed') continue;
+    if (excludeId && (a.id === excludeId || a._core_id === excludeId)) continue;
+    if (a.appointment_type_id !== appointmentType.id) continue;
+    if (overlapsBuffered(a)) count++;
+  }
+  return count >= cap;
 }
 
-function isSlotAvailable(start, end, scheduleConfig, appointments, excludeId) {
+function isSlotAvailable(start, end, scheduleConfig, appointments, excludeId, appointmentType) {
   const dayKey = DAY_KEYS[start.getDay()];
-  const dayHours = scheduleConfig.working_hours?.[dayKey];
+  const dayHours = effectiveHoursForType(scheduleConfig.working_hours, appointmentType?.scheduling_hours, dayKey);
   if (!fitsWorkingHours(start, end, dayHours)) return false;
-  if (hasConflict(start, end, appointments, scheduleConfig.buffer_minutes, excludeId)) return false;
+  if (hasConflict(start, end, appointments, scheduleConfig.buffer_minutes, excludeId, appointmentType)) return false;
   return true;
 }
 
-async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate, excludeId, scheduleConfig, appointments } = {}) {
+// `appointmentTypeId`/`appointmentType`: opt-in, default null/undefined so
+// every existing call site (none of which pass either) is byte-identical
+// to before this round. `appointmentType`, when given, is a pre-resolved
+// AppointmentType row (see generateOfferSlots, which resolves once and
+// reuses it across its offer loop rather than refetching per slot);
+// `appointmentTypeId` is resolved internally via resolveAppointmentType
+// when only the id is known and no pre-resolved row was passed in.
+async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate, excludeId, scheduleConfig, appointments, appointmentTypeId = null, appointmentType } = {}) {
   const cfg = scheduleConfig || await loadScheduleConfig();
   const appts = appointments || await loadCalendar();
+  const resolvedType = appointmentType !== undefined ? appointmentType : await resolveAppointmentType(appointmentTypeId);
   const duration = durationMinutes || cfg.default_duration_minutes;
   const now = afterDate ? new Date(afterDate) : new Date();
 
   if (preferredDate) {
     const start = new Date(preferredDate);
     const end = new Date(start.getTime() + duration * 60 * 1000);
-    if (start > now && isSlotAvailable(start, end, cfg, appts, excludeId)) {
+    if (start > now && isSlotAvailable(start, end, cfg, appts, excludeId, resolvedType)) {
       return { start, end };
     }
   }
@@ -423,7 +555,7 @@ async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate
     while (slotStart.getTime() + duration * 60 * 1000 <= dayEnd.getTime()) {
       const slotEnd = new Date(slotStart.getTime() + duration * 60 * 1000);
       if (slotStart > windowEnd) return null;
-      if (isSlotAvailable(slotStart, slotEnd, cfg, appts, excludeId)) {
+      if (isSlotAvailable(slotStart, slotEnd, cfg, appts, excludeId, resolvedType)) {
         return { start: slotStart, end: slotEnd };
       }
       slotStart = new Date(slotStart.getTime() + 15 * 60 * 1000);
@@ -433,14 +565,18 @@ async function findNextAvailableSlot({ afterDate, durationMinutes, preferredDate
   return null;
 }
 
-async function generateOfferSlots({ durationMinutes, preferredDate, afterDate, count = 3 } = {}) {
+async function generateOfferSlots({ durationMinutes, preferredDate, afterDate, count = 3, appointmentTypeId = null, excludeId } = {}) {
   const scheduleConfig = await loadScheduleConfig();
   const appointments = await loadCalendar();
+  // Resolved once and reused for every slot in the loop below, rather than
+  // re-fetching /api/v1/appointment-types on each findNextAvailableSlot
+  // call — same pattern already used for scheduleConfig/appointments here.
+  const appointmentType = await resolveAppointmentType(appointmentTypeId);
   const offers = [];
   let cursor = afterDate;
   let firstPreferred = preferredDate;
   for (let i = 0; i < count; i++) {
-    const slot = await findNextAvailableSlot({ afterDate: cursor, durationMinutes, preferredDate: firstPreferred, scheduleConfig, appointments });
+    const slot = await findNextAvailableSlot({ afterDate: cursor, durationMinutes, preferredDate: firstPreferred, scheduleConfig, appointments, appointmentType, excludeId });
     if (!slot) break;
     offers.push(slot);
     cursor = new Date(slot.end.getTime() + 15 * 60 * 1000);
@@ -460,9 +596,12 @@ function detectRelativeTimeRequest(text) {
   return null;
 }
 
-async function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3, excludeId } = {}) {
+async function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3, excludeId, appointmentTypeId = null } = {}) {
   const scheduleConfig = await loadScheduleConfig();
   const appointments = await loadCalendar();
+  // Resolved once, reused across the loop below — same reasoning as
+  // generateOfferSlots.
+  const appointmentType = await resolveAppointmentType(appointmentTypeId);
   const duration = durationMinutes || scheduleConfig.default_duration_minutes;
   const before = new Date(beforeDate);
   const dayKey = DAY_KEYS[before.getDay()];
@@ -477,7 +616,7 @@ async function findEarlierSlotsSameDay({ beforeDate, durationMinutes, count = 3,
   let slotStart = dayStart;
   while (slotStart.getTime() + duration * 60 * 1000 <= before.getTime()) {
     const slotEnd = new Date(slotStart.getTime() + duration * 60 * 1000);
-    if (isSlotAvailable(slotStart, slotEnd, scheduleConfig, appointments, excludeId)) {
+    if (isSlotAvailable(slotStart, slotEnd, scheduleConfig, appointments, excludeId, appointmentType)) {
       found.push({ start: slotStart, end: slotEnd });
     }
     slotStart = new Date(slotStart.getTime() + 15 * 60 * 1000);
@@ -513,7 +652,7 @@ function matchOfferedSlotSelection(text, offerCount) {
 
 // ─── Appointments (CRUD / Mutations via Core API) ───────────────────────────
 
-async function createAppointment({ title, start, end, contactId, attendeeName, attendeeEmail, createdVia, notes, appointmentType }) {
+async function createAppointment({ title, start, end, contactId, attendeeName, attendeeEmail, createdVia, notes, appointmentType, appointmentTypeId = null }) {
   const externalId = `appt_${Date.now()}`;
   const now = new Date().toISOString();
   const jsAppt = {
@@ -527,6 +666,7 @@ async function createAppointment({ title, start, end, contactId, attendeeName, a
     attendee_name: attendeeName || null,
     attendee_email: attendeeEmail || null,
     appointment_type: appointmentType || null,
+    appointment_type_id: appointmentTypeId || null,
     status: 'confirmed',
     rsvp_status: 'pending',
     pending_reschedule: null,
@@ -541,14 +681,22 @@ async function createAppointment({ title, start, end, contactId, attendeeName, a
   const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/appointments', {
     body: coreBody
   });
-  if (!ok) throw new Error(`Core appointment creation failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  if (!ok) {
+    // `status` is attached to the thrown Error (not just embedded in the
+    // message string) so a 400 — specifically Core's same-type concurrency
+    // cap rejection (NEW-467) — can be distinguished from a network/500
+    // failure by callers without string-matching the message text.
+    const err = new Error(`Core appointment creation failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+    err.status = status;
+    throw err;
+  }
 
   const created = mapCoreToJS(data.appointment);
   log.action('calendar', `Appointment created: ${created.title}`, { id: created.id, start: created.start });
   return created;
 }
 
-async function proposeAppointment({ title, contactId, attendeeName, attendeeEmail, createdVia, offeredSlots = [], appointmentType = null }) {
+async function proposeAppointment({ title, contactId, attendeeName, attendeeEmail, createdVia, offeredSlots = [], appointmentType = null, appointmentTypeId = null }) {
   const externalId = `appt_${Date.now()}`;
   const primary = offeredSlots[0] || null;
   const now = new Date().toISOString();
@@ -563,6 +711,7 @@ async function proposeAppointment({ title, contactId, attendeeName, attendeeEmai
     attendee_name: attendeeName || null,
     attendee_email: attendeeEmail || null,
     appointment_type: appointmentType,
+    appointment_type_id: appointmentTypeId,
     status: 'negotiating',
     form_sent: false,
     rsvp_status: 'pending',
@@ -598,6 +747,7 @@ async function updateAppointment(id, updates) {
   if (updates.start !== undefined) coreUpdates.start_time = updates.start ? new Date(updates.start).toISOString() : null;
   if (updates.end !== undefined) coreUpdates.end_time = updates.end ? new Date(updates.end).toISOString() : null;
   if (updates.appointment_type !== undefined) coreUpdates.appointment_type = updates.appointment_type;
+  if (updates.appointment_type_id !== undefined) coreUpdates.appointment_type_id = updates.appointment_type_id;
   if (updates.status !== undefined) coreUpdates.status = updates.status;
   if (updates.rsvp_status !== undefined) coreUpdates.rsvp_status = updates.rsvp_status;
   if (updates.notes !== undefined) coreUpdates.notes = updates.notes;
@@ -613,7 +763,15 @@ async function updateAppointment(id, updates) {
   const { ok, status, data, parseError } = await coreRequest('POST', `/api/v1/appointments/${coreId}/update`, {
     body: coreUpdates
   });
-  if (!ok) throw new Error(`Core appointment update failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+  if (!ok) {
+    // Same `err.status` tagging as createAppointment — a 400 here from a
+    // confirm/status-change write (confirmNegotiation, rescheduleAppointment)
+    // is Core's same-type concurrency cap rejecting a since-filled slot
+    // (NEW-467); every other status keeps throwing a plain error.
+    const err = new Error(`Core appointment update failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
+    err.status = status;
+    throw err;
+  }
   return mapCoreToJS(data.appointment);
 }
 
@@ -792,6 +950,11 @@ export {
   mapCoreToJS,
   mapJSToCore,
   loadCalendar,
+  loadAppointmentTypes,
+  resolveAppointmentType,
+  effectiveHoursForType,
+  hasConflict,
+  isSlotAvailable,
   loadScheduleConfig,
   saveScheduleConfig,
   parseDatetimePhrase,

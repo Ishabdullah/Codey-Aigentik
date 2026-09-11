@@ -1148,15 +1148,31 @@ Return ONLY JSON.`;
       const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate });
       if (!slot) { reply('I couldn\'t find an open slot for that.'); break; }
 
-      const appt = await calendarModule.createAppointment({
-        title: `Appointment with ${contact.name || targetName}`,
-        start: slot.start,
-        end: slot.end,
-        contactId: contact.id,
-        attendeeName: contact.name || targetName,
-        attendeeEmail: contact.emails[0],
-        createdVia: 'owner'
-      });
+      let appt;
+      try {
+        appt = await calendarModule.createAppointment({
+          title: `Appointment with ${contact.name || targetName}`,
+          start: slot.start,
+          end: slot.end,
+          contactId: contact.id,
+          attendeeName: contact.name || targetName,
+          attendeeEmail: contact.emails[0],
+          createdVia: 'owner'
+        });
+      } catch (e) {
+        // NEW-467: Core's same-type concurrency cap can now reject a slot
+        // that was open a moment ago (someone else booked it first). Only
+        // a 400 gets this graceful re-offer; any other failure keeps
+        // throwing, same as before this round.
+        if (e.status !== 400) throw e;
+        const offers = await calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3 });
+        if (offers.length === 0) {
+          reply('That slot just filled and I couldn\'t find another opening right now — try a different time.');
+          break;
+        }
+        reply(`That slot just filled. Here's what's open instead:\n${calendarModule.formatOfferList(offers)}\n\nSay "schedule appointment with ${targetName} at <time>" with one of these to book it.`);
+        break;
+      }
 
       if (gmail) {
         await gmail.sendCalendarInvite(appt, contact.emails[0]);
@@ -1186,7 +1202,20 @@ Return ONLY JSON.`;
       const slot = await calendarModule.findNextAvailableSlot({ afterDate, durationMinutes: duration, preferredDate, excludeId: appt.id });
       if (!slot) { reply('That time isn\'t available and I couldn\'t find a nearby opening.'); break; }
 
-      const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
+      let updated;
+      try {
+        updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
+      } catch (e) {
+        // NEW-467, same reasoning as schedule_appointment above.
+        if (e.status !== 400) throw e;
+        const offers = await calendarModule.generateOfferSlots({ durationMinutes: duration, afterDate, count: 3, excludeId: appt.id });
+        if (offers.length === 0) {
+          reply('That slot just filled and I couldn\'t find another opening nearby — try a different time.');
+          break;
+        }
+        reply(`That slot just filled. Here's what's open instead:\n${calendarModule.formatOfferList(offers)}\n\nSay "reschedule ${targetName} to <time>" with one of these to move it.`);
+        break;
+      }
       if (gmail && updated.attendee_email) {
         await gmail.sendCalendarInvite(updated, updated.attendee_email);
         await gmail.sendCalendarInvite(updated, config.owner?.admin_email || config.gmail.email);
@@ -1577,5 +1606,6 @@ export {
   handleSetBusinessInfo,
   handleSetOwnerName,
   getAigentikName,
-  coreRequest
+  coreRequest,
+  executeInterpretedCommand
 };

@@ -333,9 +333,39 @@ async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, s
   // (seeded at proposal time, before the name was known — see the
   // proposeAppointment call site) are corrected in the same Core update.
   const bookedContact = negotiation.contact_id ? await contacts.getContactById(negotiation.contact_id) : null;
-  const appt = await calendarModule.confirmNegotiation(
-    negotiation.id, slot.start, slot.end, attendeeEmail, bookedContact?.name || null
-  );
+  let appt;
+  try {
+    appt = await calendarModule.confirmNegotiation(
+      negotiation.id, slot.start, slot.end, attendeeEmail, bookedContact?.name || null
+    );
+  } catch (e) {
+    // NEW-467: Core now enforces a same-type concurrency cap at confirm
+    // time, so a slot that was open when offered can 400 here if it filled
+    // in the meantime. Only a 400 gets this graceful re-offer — a network
+    // error or 500 still propagates and is handled the same as before this
+    // round (whatever caught the throw upstream). No invite/notification
+    // has been sent yet at this point (they're below this catch), so a
+    // failed confirm can never emit a booking confirmation.
+    if (e.status !== 400) throw e;
+    log.warn('index', 'Confirm rejected by Core (slot no longer available), re-offering', {
+      negotiationId: negotiation.id, error: e.message
+    });
+    const duration = (new Date(slot.end) - new Date(slot.start)) / 60000;
+    const offers = await calendarModule.generateOfferSlots({
+      durationMinutes: duration,
+      afterDate: new Date(),
+      count: 3,
+      appointmentTypeId: negotiation.appointment_type_id || null
+    });
+    if (offers.length === 0) {
+      await reply("I'm sorry, that time just filled and I wasn't able to find another opening right now — I'll have my owner reach out directly.");
+      await gmail.sendOwnerNotification(`⚠️ A slot filled between offer and confirm for ${senderLabel}, and no alternatives were found.`);
+      return;
+    }
+    await calendarModule.updateNegotiationOffers(negotiation.id, offers);
+    await reply(`Sorry, that time just filled! Here's what's still open:\n${calendarModule.formatOfferList(offers)}\n\nWhich works for you, or suggest another time?`);
+    return;
+  }
   const details = await customerDetailBlock(appt, senderLabel, attendeeEmail);
   if (attendeeEmail) await gmail.sendCalendarInvite(appt, attendeeEmail);
   await gmail.sendCalendarInvite(appt, adminEmail,
@@ -1793,5 +1823,6 @@ export {
   sendOnboardingEmail,
   main,
   coreRequest,
-  customerDetailBlock
+  customerDetailBlock,
+  confirmAndClose
 };
