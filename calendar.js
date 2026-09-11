@@ -136,14 +136,44 @@ async function loadCalendar() {
   return (data.appointments || []).map(mapCoreToJS);
 }
 
+// Deep-merge Core's working_hours over DEFAULT_SCHEDULE_CONFIG.working_hours,
+// per weekday key. Core sends an empty {} when the owner has never set hours
+// (B2 write-through) — that must mean "use the default open week", not "no open
+// days" (NEW-465). A non-empty object is merged per-key: a key Core actually
+// sends wins even when its value is an explicit null (day off, set by
+// setDayOff); only keys Core omits fall back to the default. Builds a fresh
+// object — never mutates the DEFAULT_SCHEDULE_CONFIG module constant.
+function mergeWorkingHours(coreWorkingHours) {
+  const cloneDay = (day) => {
+    const def = DEFAULT_SCHEDULE_CONFIG.working_hours[day];
+    return def ? { ...def } : def;
+  };
+  const hasCore = coreWorkingHours && typeof coreWorkingHours === 'object' &&
+    Object.keys(coreWorkingHours).length > 0;
+  const merged = {};
+  for (const day of DAY_KEYS) {
+    if (hasCore && Object.prototype.hasOwnProperty.call(coreWorkingHours, day)) {
+      merged[day] = coreWorkingHours[day];
+    } else {
+      merged[day] = cloneDay(day);
+    }
+  }
+  return merged;
+}
+
 async function loadScheduleConfig() {
   try {
     const { ok, status, data } = await coreRequest('GET', '/api/v1/schedule-config');
     if (ok && data?.schedule_config) {
-      return { ...DEFAULT_SCHEDULE_CONFIG, ...data.schedule_config };
+      const core = data.schedule_config;
+      return {
+        ...DEFAULT_SCHEDULE_CONFIG,
+        ...core,
+        working_hours: mergeWorkingHours(core.working_hours)
+      };
     }
     if (status === 404) {
-      return { ...DEFAULT_SCHEDULE_CONFIG };
+      return { ...DEFAULT_SCHEDULE_CONFIG, working_hours: mergeWorkingHours(null) };
     }
   } catch (e) {
     log.warn('calendar', 'Could not load schedule config from Core, using defaults', { error: e.message });

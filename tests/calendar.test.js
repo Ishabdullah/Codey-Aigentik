@@ -257,6 +257,91 @@ describe('calendar (Core write-through)', () => {
       expect(cfg.default_duration_minutes).toBe(30);
       expect(cfg.booking_window_days).toBe(365);
     });
+
+    const ALL_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+    function mockScheduleConfig(schedule_config) {
+      fetchSpy.mockResolvedValue(mockResponse(200, { schedule_config }));
+    }
+
+    it('empty working_hours {} from Core → full 7-day open week from DEFAULT (NEW-465)', async () => {
+      mockScheduleConfig({ working_hours: {}, default_duration_minutes: 30 });
+      const cfg = await calendar.loadScheduleConfig();
+      for (const day of ALL_DAYS) {
+        expect(cfg.working_hours[day]).toEqual({ start: '00:00', end: '23:59' });
+      }
+    });
+
+    it('missing working_hours key entirely from Core → full DEFAULT week', async () => {
+      mockScheduleConfig({ default_duration_minutes: 45 });
+      const cfg = await calendar.loadScheduleConfig();
+      for (const day of ALL_DAYS) {
+        expect(cfg.working_hours[day]).toEqual({ start: '00:00', end: '23:59' });
+      }
+      expect(cfg.default_duration_minutes).toBe(45);
+    });
+
+    it('partial working_hours from Core → present day custom, other 6 from DEFAULT', async () => {
+      mockScheduleConfig({ working_hours: { mon: { start: '08:00', end: '12:00' } } });
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.working_hours.mon).toEqual({ start: '08:00', end: '12:00' });
+      for (const day of ALL_DAYS.filter(d => d !== 'mon')) {
+        expect(cfg.working_hours[day]).toEqual({ start: '00:00', end: '23:59' });
+      }
+    });
+
+    it('explicit working_hours {tue: null} from Core → tue is a day off, others DEFAULT', async () => {
+      mockScheduleConfig({ working_hours: { tue: null } });
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.working_hours.tue).toBeNull();
+      for (const day of ALL_DAYS.filter(d => d !== 'tue')) {
+        expect(cfg.working_hours[day]).toEqual({ start: '00:00', end: '23:59' });
+      }
+    });
+
+    it('full 7-day grid from Core → passed through unchanged (no default bleed)', async () => {
+      const grid = {
+        sun: null,
+        mon: { start: '09:00', end: '17:00' },
+        tue: { start: '09:00', end: '17:00' },
+        wed: { start: '09:00', end: '17:00' },
+        thu: { start: '09:00', end: '17:00' },
+        fri: { start: '09:00', end: '15:00' },
+        sat: null
+      };
+      mockScheduleConfig({ working_hours: grid });
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.working_hours).toEqual(grid);
+    });
+
+    it('other top-level fields still take the Core value when present', async () => {
+      mockScheduleConfig({
+        working_hours: {},
+        buffer_minutes: 5,
+        default_duration_minutes: 60,
+        booking_window_days: 90
+      });
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.buffer_minutes).toBe(5);
+      expect(cfg.default_duration_minutes).toBe(60);
+      expect(cfg.booking_window_days).toBe(90);
+    });
+
+    it('404 branch returns a fresh working_hours, not the DEFAULT constant', async () => {
+      fetchSpy.mockResolvedValue(mockResponse(404, { error: 'Not found' }));
+      const first = await calendar.loadScheduleConfig();
+      first.working_hours.sat = null; // simulates setDayOff mutating the loaded config
+      const second = await calendar.loadScheduleConfig();
+      expect(second.working_hours.sat).toEqual({ start: '00:00', end: '23:59' });
+    });
+
+    it('does not mutate DEFAULT_SCHEDULE_CONFIG across calls', async () => {
+      mockScheduleConfig({ working_hours: { mon: { start: '08:00', end: '12:00' } } });
+      await calendar.loadScheduleConfig();
+      mockScheduleConfig({ working_hours: {} });
+      const cfg = await calendar.loadScheduleConfig();
+      expect(cfg.working_hours.mon).toEqual({ start: '00:00', end: '23:59' });
+    });
   });
 
   describe('createAppointment & proposeAppointment', () => {
