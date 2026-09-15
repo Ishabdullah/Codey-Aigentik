@@ -295,6 +295,22 @@ describe('subcontractor-recruiter (Core write-through)', () => {
       expect(backToCore.msa_signed).toBe(0);
       expect(backToCore.last_contact_at).toBe('2026-08-27T12:00:00.000Z');
     });
+
+    it('strips stale pre-mapped JS-side keys so the Core POST body never carries both old and new names (NEW-517)', () => {
+      const jsObj = {
+        subcontractor_id: 'sub_0042',
+        last_contact: '2026-09-15T00:00:00.000Z',
+        company_name: 'Stale Key Test LLC'
+      };
+
+      const coreObj = mapJSToCore(jsObj);
+
+      expect(coreObj).not.toHaveProperty('subcontractor_id');
+      expect(coreObj).not.toHaveProperty('last_contact');
+      expect(coreObj.external_id).toBe('sub_0042');
+      expect(coreObj.last_contact_at).toBe('2026-09-15T00:00:00.000Z');
+      expect(coreObj.company_name).toBe('Stale Key Test LLC');
+    });
   });
 
   describe('loadSubcontractors', () => {

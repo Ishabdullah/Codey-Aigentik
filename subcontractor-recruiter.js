@@ -87,7 +87,9 @@ function mapJSToCore(jsObj) {
   coreObj.external_id = jsObj.subcontractor_id;
   coreObj.id = jsObj.id;
   coreObj.last_contact_at = jsObj.last_contact;
-  
+  delete coreObj.subcontractor_id;
+  delete coreObj.last_contact;
+
   const boolFields = [
     'w9_received', 'msa_signed', 'coi_received', 'msa_sent',
     'workers_comp', 'license_required', 'general_liability',
