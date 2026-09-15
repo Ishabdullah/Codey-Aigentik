@@ -44,11 +44,37 @@ export function startHttpServer() {
             res.end(JSON.stringify({ error: 'Email provider not initialized' }));
             return;
           }
-          await emailProvider.sendCalendarInvite(data.to, data.appointment, data.text);
+          // NEW-506 finding: this call had appointment/email transposed
+          // relative to sendCalendarInvite's real signature
+          // (appointment, toEmail, bodyText) -- fixed.
+          await emailProvider.sendCalendarInvite(data.appointment, data.to, data.text);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true }));
         } catch (error) {
           logger.error('Error in /send-invite:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: error.message }));
+        }
+      });
+    } else if (req.method === 'POST' && req.url === '/send-cancellation') {
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk.toString();
+      });
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          const emailProvider = getEmailProvider();
+          if (!emailProvider) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Email provider not initialized' }));
+            return;
+          }
+          await emailProvider.sendCalendarCancellation(data.appointment, data.to, data.text);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true }));
+        } catch (error) {
+          logger.error('Error in /send-cancellation:', error);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: error.message }));
         }
