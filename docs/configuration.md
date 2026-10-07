@@ -88,6 +88,8 @@ A few fields are worth calling out specifically:
 
 - **`core_api`** is required for `do-not-contact.js` to function at all: it writes through to Restoricon Core's `/api/v1/do-not-contact*` routes over HTTP, with no local-file fallback — a failed/misconfigured Core call throws rather than silently degrading, since a silent fallback here could mean a suppressed contact gets re-contacted. `token` must be a bearer token for a Core user with the `ai_agent` role (`restoricon_core/auth.py`'s `ROLE_AI_AGENT`); generate one from a Codey-OS checkout with `python -m tools.provision_ai_agent_auth` (reruns are idempotent — same user, fresh token each time). `base_url` must point at a running Restoricon Core API instance (`restoricon_core/api/server.py`, default port `8770`).
 
+- **The internal HTTP server's bearer token (WP0.1, 2026-10-07) is not a `config.json` field** — it lives in `~/.codeyOS/aigentik_internal_token` (or the `AIGENTIK_INTERNAL_TOKEN` env var, which wins if set), shared with `restoricon_core/services/notification_service.py` on the Codey-OS side. Codey-OS's `install.sh` generates this file automatically; nothing to configure here unless you're running Aigentik without having run that installer, in which case `http-server.js` logs a startup warning and every request to `/send-email`/`/send-invite`/`/send-cancellation` gets a `401` until the file exists. Before WP0.1 these three routes had no authentication at all (`NEW-764`).
+
 See [Installation](installation.md) for how `install.sh` generates a starter `config.json` for you, and [Data files](data-files.md) for everything else persisted under `data/`.
 
 ---
