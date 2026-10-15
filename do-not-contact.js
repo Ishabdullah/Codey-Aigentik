@@ -153,11 +153,16 @@ async function addToDoNotContact({ identifier, name, reason, source }) {
   return entry;
 }
 
-async function removeFromDoNotContact(identifier) {
+// `confirmed: true` must be passed ONLY from a call site that already sits
+// inside a post-"yes" pendingConfirmations execute() closure (see
+// owner-command.js's unblock_contact flow) -- Core's /do-not-contact/remove
+// route fails closed for an ai_agent-role token (this script's own
+// write-through identity) without it (NEW-919/920/921).
+async function removeFromDoNotContact(identifier, { confirmed } = {}) {
   const classified = classifyIdentifier(identifier);
   if (!classified) return false;
   const { ok, status, data, parseError } = await coreRequest('POST', '/api/v1/do-not-contact/remove', {
-    body: { identifier }
+    body: confirmed ? { identifier, confirmed: true } : { identifier }
   });
   if (!ok) throw new Error(`Core do-not-contact remove failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
   const removed = !!data.removed;

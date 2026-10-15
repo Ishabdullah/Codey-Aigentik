@@ -221,18 +221,28 @@ async function handleBlockContact(target, reason, customReply) {
 async function handleUnblockContact(target, customReply) {
   const replyFn = customReply || reply;
   if (!target) { await replyFn('Who should I unblock?'); return; }
-  const identifiers = await resolveIdentifiers(target);
-  const candidates = identifiers.length ? identifiers : [target];
-  const removed = [];
-  for (const id of candidates) {
-    if (await doNotContact.removeFromDoNotContact(id)) removed.push(id);
-  }
-  if (removed.length === 0) {
-    await replyFn(`"${target}" isn't on the do-not-contact list.`);
-    return;
-  }
-  await replyFn(`✅ Unblocked ${target}.`);
-  log.action('owner-command', `Owner unblocked: ${target}`, { identifiers: removed });
+
+  // NEW-919/920/921: mirrors delete_contact's pendingConfirmations pattern
+  // exactly -- Core now fails closed on this mutation for an unconfirmed
+  // ai_agent-role call, so the owner must confirm before this script
+  // passes confirmed: true.
+  pendingConfirmations.set('pending', {
+    execute: async () => {
+      const identifiers = await resolveIdentifiers(target);
+      const candidates = identifiers.length ? identifiers : [target];
+      const removed = [];
+      for (const id of candidates) {
+        if (await doNotContact.removeFromDoNotContact(id, { confirmed: true })) removed.push(id);
+      }
+      if (removed.length === 0) {
+        await replyFn(`"${target}" isn't on the do-not-contact list.`);
+        return;
+      }
+      await replyFn(`✅ Unblocked ${target}.`);
+      log.action('owner-command', `Owner unblocked: ${target}`, { identifiers: removed });
+    }
+  });
+  await replyFn(`⚠️ Unblock "${target}"? They will be able to be contacted again.\n\nReply "yes" to confirm or "no" to cancel.`);
 }
 
 // Marks setup complete once both identity fields Aigentik asks for on
@@ -815,20 +825,29 @@ Return ONLY JSON.`;
       const identifier = cmd.rule_description || cmd.content || cmd.target;
       if (!identifier) { reply('Which rule? Say "remove rule [description]" or check "email rules" / "sms rules" for the exact wording.'); break; }
 
-      let removed;
-      if (ruleType === 'sms') {
-        const smsRules = await import('./sms-rules.js');
-        removed = await smsRules.removeRule(identifier);
-      } else {
-        removed = await emailRules.removeRule(identifier);
-      }
+      // NEW-919/920/921: mirrors delete_contact's pendingConfirmations
+      // pattern exactly -- Core now fails closed on this mutation for an
+      // unconfirmed ai_agent-role call, so the owner must confirm before
+      // this script passes confirmed: true.
+      pendingConfirmations.set('pending', {
+        execute: async () => {
+          let removed;
+          if (ruleType === 'sms') {
+            const smsRules = await import('./sms-rules.js');
+            removed = await smsRules.removeRule(identifier, { confirmed: true });
+          } else {
+            removed = await emailRules.removeRule(identifier, { confirmed: true });
+          }
 
-      if (removed) {
-        reply(`✅ Removed the ${ruleType} rule matching "${identifier}".`);
-        log.action('owner-command', `Removed ${ruleType} rule: ${identifier}`);
-      } else {
-        reply(`Couldn't find a ${ruleType} rule matching "${identifier}". Say "${ruleType} rules" to see the list.`);
-      }
+          if (removed) {
+            reply(`✅ Removed the ${ruleType} rule matching "${identifier}".`);
+            log.action('owner-command', `Removed ${ruleType} rule: ${identifier}`);
+          } else {
+            reply(`Couldn't find a ${ruleType} rule matching "${identifier}". Say "${ruleType} rules" to see the list.`);
+          }
+        }
+      });
+      reply(`⚠️ Remove the ${ruleType} rule matching "${identifier}"? This cannot be undone.\n\nReply "yes" to confirm or "no" to cancel.`);
       break;
     }
 
@@ -1114,7 +1133,7 @@ Return ONLY JSON.`;
 
       pendingConfirmations.set('pending', {
         execute: async () => {
-          await contacts.deleteContact(contact.id);
+          await contacts.deleteContact(contact.id, { confirmed: true });
           reply(`🗑️ Deleted ${contact.name || targetName} from contacts.`);
           log.action('owner-command', `Deleted contact: ${targetName}`);
         }

@@ -102,7 +102,12 @@ async function addRule({ description, condition_type, condition_value, action, a
   return rule;
 }
 
-async function removeRule(identifier) {
+// `confirmed: true` must be passed ONLY from a call site that already sits
+// inside a post-"yes" pendingConfirmations execute() closure (see
+// owner-command.js's remove_rule case) -- Core's /automation-rules/{id}/delete
+// route fails closed for an ai_agent-role token (this script's own
+// write-through identity) without it (NEW-919/920/921).
+async function removeRule(identifier, { confirmed } = {}) {
   const rules = await loadRules();
   const idx = rules.findIndex(r =>
     r.id === identifier ||
@@ -111,7 +116,9 @@ async function removeRule(identifier) {
   );
   if (idx === -1) return false;
   const removed = rules[idx];
-  const { ok, status, data, parseError } = await coreRequest('POST', `/api/v1/automation-rules/${removed.id}/delete`);
+  const { ok, status, data, parseError } = await coreRequest('POST', `/api/v1/automation-rules/${removed.id}/delete`, {
+    body: confirmed ? { confirmed: true } : undefined
+  });
   if (!ok) throw new Error(`Core automation-rules delete failed (${status}): ${data?.error || parseError?.message || 'unknown error'}`);
   if (data.deleted) log.info('sms-rules', `Rule removed: ${removed.description}`);
   return !!data.deleted;

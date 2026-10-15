@@ -358,13 +358,19 @@ async function updateContact(id, updates) {
   return updated;
 }
 
-// Delete a contact entirely
-async function deleteContact(identifier) {
+// Delete a contact entirely. `confirmed: true` must be passed ONLY from a
+// call site that already sits inside a post-"yes" pendingConfirmations
+// execute() closure (see owner-command.js's delete_contact case) -- Core's
+// /contacts/{id}/delete route fails closed for an ai_agent-role token
+// (this script's own write-through identity) without it (NEW-919/920/921).
+async function deleteContact(identifier, { confirmed } = {}) {
   if (!identifier) return false;
   const contact = (await getContactById(identifier)) || (await findContact(identifier)) || (await findByRelationship(identifier));
   if (!contact) return false;
 
-  const res = await coreRequest('POST', `/api/v1/contacts/${encodeURIComponent(contact.id)}/delete`);
+  const res = await coreRequest('POST', `/api/v1/contacts/${encodeURIComponent(contact.id)}/delete`, {
+    body: confirmed ? { confirmed: true } : undefined
+  });
   if (!res.ok) {
     log.error('contacts', `deleteContact failed for ${identifier}`, { status: res.status });
     return false;
