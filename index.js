@@ -292,6 +292,14 @@ function inviteSentNote() {
   return " I've sent a calendar invite to your email — if you don't see it in a few minutes, check your spam folder.";
 }
 
+// NEW-927/928 (WP2.1 group 8): counterpart to inviteSentNote() for when
+// gmail.sendCalendarInvite actually returned false (do-not-contact block
+// or provider-level failure) — every call site that claims an invite was
+// sent must check the real return value first, not assume success.
+function inviteNotSentNote() {
+  return " Note: I wasn't able to send a calendar invite to your email on file, so please reach out if you need the details again.";
+}
+
 // Name/phone/address live on the linked contact record (collected during
 // intake via applyExtractedDetails), not on the appointment itself — this
 // pulls them together so the admin gets full customer info on every booking
@@ -367,16 +375,20 @@ async function confirmAndClose({ negotiation, slot, attendeeEmail, adminEmail, s
     return;
   }
   const details = await customerDetailBlock(appt, senderLabel, attendeeEmail);
-  if (attendeeEmail) await gmail.sendCalendarInvite(appt, attendeeEmail);
+  // NEW-927/928: capture the real result instead of assuming success — a
+  // do-not-contact block or provider failure returns false, and the
+  // confirmation text below must reflect that, not claim an invite went
+  // out when it didn't.
+  const inviteSent = attendeeEmail ? await gmail.sendCalendarInvite(appt, attendeeEmail) : false;
   await gmail.sendCalendarInvite(appt, adminEmail,
     `📅 New appointment booked: ${appt.title} at ${new Date(appt.start).toLocaleString()}.\n\n${details}`);
-  
+
   const customerSummaryText = `\n\nHere is the information I have saved for you:\n${details}\n\nPlease let me know if any of this is incorrect or needs updating!`;
 
   await reply(
     `You're all set! ${typeLabel} on ${new Date(appt.start).toLocaleString()}.` +
-    (attendeeEmail ? inviteSentNote() : '') +
-    closingReassurance(appt.appointment_type) + 
+    (attendeeEmail ? (inviteSent ? inviteSentNote() : inviteNotSentNote()) : '') +
+    closingReassurance(appt.appointment_type) +
     customerSummaryText
   );
   await gmail.sendOwnerNotification(
@@ -685,12 +697,14 @@ async function handleRescheduleRequest({ classified, contact, reply, adminEmail,
   if (slot.start.getTime() === preferredDate.getTime()) {
     const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
     const details = await customerDetailBlock(updated, contact?.name || senderLabel, updated.attendee_email);
-    if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
+    // NEW-927/928: see confirmAndClose above — don't assume the invite went
+    // out, check the real return value before claiming it did.
+    const inviteSent = updated.attendee_email ? await gmail.sendCalendarInvite(updated, updated.attendee_email) : false;
     await gmail.sendCalendarInvite(updated, adminEmail,
       `🔁 Appointment rescheduled: ${updated.title} now at ${new Date(updated.start).toLocaleString()}.\n\n${details}`);
     await reply(
       `Got it — moved to ${new Date(updated.start).toLocaleString()}.` +
-      (updated.attendee_email ? inviteSentNote() : ' Updated invite sent.') +
+      (updated.attendee_email ? (inviteSent ? inviteSentNote() : inviteNotSentNote()) : ' Updated invite sent.') +
       closingReassurance(updated.appointment_type)
     );
     await gmail.sendOwnerNotification(
@@ -729,12 +743,14 @@ async function handleRescheduleReply({ appt, text, reply, adminEmail, senderLabe
     const updated = await calendarModule.rescheduleAppointment(appt.id, slot.start, slot.end);
     await calendarModule.clearPendingReschedule(updated.id);
     const details = await customerDetailBlock(updated, senderLabel, updated.attendee_email);
-    if (updated.attendee_email) await gmail.sendCalendarInvite(updated, updated.attendee_email);
+    // NEW-927/928: see confirmAndClose above — don't assume the invite went
+    // out, check the real return value before claiming it did.
+    const inviteSent = updated.attendee_email ? await gmail.sendCalendarInvite(updated, updated.attendee_email) : false;
     await gmail.sendCalendarInvite(updated, adminEmail,
       `🔁 Appointment rescheduled: ${updated.title} now at ${new Date(updated.start).toLocaleString()}.\n\n${details}`);
     await reply(
       `Got it — moved to ${new Date(updated.start).toLocaleString()}.` +
-      (updated.attendee_email ? inviteSentNote() : ' Updated invite sent.') +
+      (updated.attendee_email ? (inviteSent ? inviteSentNote() : inviteNotSentNote()) : ' Updated invite sent.') +
       closingReassurance(updated.appointment_type)
     );
     await gmail.sendOwnerNotification(
@@ -762,7 +778,14 @@ async function handleCancelRequest({ classified, contact, reply, adminEmail, sen
   }
 
   await calendarModule.cancelAppointment(appt.id);
-  if (appt.attendee_email) await gmail.sendCalendarCancellation(appt, appt.attendee_email);
+  // NEW-927/928: this reply never claimed an email was sent either way, so
+  // there's no customer-facing text to fix — but silently discarding a
+  // do-not-contact block/send failure here would still hide it from the
+  // owner, so log it instead.
+  const cancellationSent = appt.attendee_email ? await gmail.sendCalendarCancellation(appt, appt.attendee_email) : true;
+  if (!cancellationSent) {
+    log.warn('index', 'Cancellation notice not sent to customer (do-not-contact block or send failure)', { to: appt.attendee_email });
+  }
   await gmail.sendCalendarCancellation(appt, adminEmail);
   await reply(`Done — your appointment on ${new Date(appt.start).toLocaleString()} has been cancelled. Let us know whenever you're ready to rebook.`);
   await gmail.sendOwnerNotification(`🚫 Appointment cancelled by ${contact?.name || senderLabel}: was ${new Date(appt.start).toLocaleString()}`);

@@ -1193,11 +1193,19 @@ Return ONLY JSON.`;
         break;
       }
 
+      // NEW-927/928: capture the real result instead of assuming success —
+      // a do-not-contact block or provider failure returns false, and the
+      // owner must not be told an invite went out when it didn't.
+      let inviteSent = false;
       if (gmail) {
-        await gmail.sendCalendarInvite(appt, contact.emails[0]);
+        inviteSent = await gmail.sendCalendarInvite(appt, contact.emails[0]);
         await gmail.sendCalendarInvite(appt, config.owner?.admin_email || config.gmail.email);
       }
-      reply(`✅ Booked ${appt.title} for ${new Date(appt.start).toLocaleString()}. Invite sent to ${contact.emails[0]}.`);
+      if (inviteSent) {
+        reply(`✅ Booked ${appt.title} for ${new Date(appt.start).toLocaleString()}. Invite sent to ${contact.emails[0]}.`);
+      } else {
+        reply(`✅ Booked ${appt.title} for ${new Date(appt.start).toLocaleString()}, but the invite was NOT sent: ${contact.emails[0]} is on your do-not-contact list (or the send failed).`);
+      }
       log.action('owner-command', `schedule_appointment: ${targetName} @ ${appt.start}`);
       break;
     }
@@ -1235,11 +1243,17 @@ Return ONLY JSON.`;
         reply(`That slot just filled. Here's what's open instead:\n${calendarModule.formatOfferList(offers)}\n\nSay "reschedule ${targetName} to <time>" with one of these to move it.`);
         break;
       }
+      // NEW-927/928: same reasoning as schedule_appointment above.
+      let inviteSent = true;
       if (gmail && updated.attendee_email) {
-        await gmail.sendCalendarInvite(updated, updated.attendee_email);
+        inviteSent = await gmail.sendCalendarInvite(updated, updated.attendee_email);
         await gmail.sendCalendarInvite(updated, config.owner?.admin_email || config.gmail.email);
       }
-      reply(`✅ Moved ${updated.title} to ${new Date(updated.start).toLocaleString()}.`);
+      if (inviteSent) {
+        reply(`✅ Moved ${updated.title} to ${new Date(updated.start).toLocaleString()}.`);
+      } else {
+        reply(`✅ Moved ${updated.title} to ${new Date(updated.start).toLocaleString()}, but the updated invite was NOT sent: ${updated.attendee_email} is on your do-not-contact list (or the send failed).`);
+      }
       log.action('owner-command', `reschedule_appointment: ${targetName} -> ${updated.start}`);
       break;
     }
@@ -1258,11 +1272,17 @@ Return ONLY JSON.`;
       pendingConfirmations.set('pending', {
         execute: async () => {
           await calendarModule.cancelAppointment(appt.id);
+          // NEW-927/928: same reasoning as schedule_appointment above.
+          let cancellationSent = true;
           if (gmail) {
-            if (appt.attendee_email) await gmail.sendCalendarCancellation(appt, appt.attendee_email);
+            cancellationSent = appt.attendee_email ? await gmail.sendCalendarCancellation(appt, appt.attendee_email) : true;
             await gmail.sendCalendarCancellation(appt, config.owner?.admin_email || config.gmail.email);
           }
-          reply(`🚫 Cancelled ${appt.title} (was ${new Date(appt.start).toLocaleString()}).`);
+          if (cancellationSent) {
+            reply(`🚫 Cancelled ${appt.title} (was ${new Date(appt.start).toLocaleString()}).`);
+          } else {
+            reply(`🚫 Cancelled ${appt.title} (was ${new Date(appt.start).toLocaleString()}), but the cancellation notice was NOT sent to ${appt.attendee_email}: they're on your do-not-contact list (or the send failed).`);
+          }
           log.action('owner-command', `Cancelled appointment for ${targetName}`);
         }
       });
